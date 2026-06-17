@@ -24,5 +24,6 @@ if not exist ".venv\Scripts\python.exe" (
 
 echo.
 echo Install complete.
-echo For scanned/photo bills, also install Tesseract OCR and Poppler. See LOCAL_SETUP.md.
+echo This is the lightweight install for normal use and 8 GB RAM PCs.
+echo For scanned/photo bills, install Tesseract OCR and Poppler. See LOCAL_SETUP.md.
 pause

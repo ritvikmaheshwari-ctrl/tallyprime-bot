@@ -3140,6 +3140,9 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
     .downloads {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }}
     .downloads a {{ color: #174ea6; background: #eef3fe; text-decoration: none; padding: 10px 12px; border-radius: 999px; font-weight: 600; }}
     .table-wrap {{ overflow: auto; border: 1px solid #e3e7ed; border-radius: 14px; background: #fff; }}
+    .review-scroll-top {{ overflow-x: auto; overflow-y: hidden; border: 1px solid #e3e7ed; border-bottom: 0; border-radius: 14px 14px 0 0; background: #fff; height: 18px; }}
+    .review-scroll-inner {{ height: 1px; min-width: 900px; }}
+    .review-table-wrap {{ max-height: 68vh; border-radius: 0 0 14px 14px; }}
     table {{ width: 100%; border-collapse: collapse; background: #fff; font-size: 14px; }}
     th, td {{ border-bottom: 1px solid #e8edf3; padding: 11px 12px; text-align: left; vertical-align: top; }}
     th {{ background: #f7f9fc; font-size: 12px; text-transform: uppercase; color: #5f6368; letter-spacing: 0.04em; }}
@@ -3200,8 +3203,9 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
     <section>
       <form action="/update_entries" method="post">
         {update_button}
-        <div class="table-wrap">
-          <table>
+        <div class="review-scroll-top" data-sync-scroll="entryReview"><div class="review-scroll-inner"></div></div>
+        <div class="table-wrap review-table-wrap" data-sync-scroll="entryReview">
+          <table class="review-table">
             <thead>
               <tr><th>Source</th><th>Voucher</th><th>Date</th><th>Party ledger</th><th>Amount</th><th>Confidence</th><th>Review</th></tr>
             </thead>
@@ -3235,6 +3239,18 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
         formatSelect.addEventListener("change", syncDateFilterPlaceholders);
       }}
       syncDateFilterPlaceholders();
+      document.querySelectorAll(".review-scroll-top").forEach((topScroll) => {{
+        const key = topScroll.dataset.syncScroll;
+        const tableWrap = document.querySelector(`.review-table-wrap[data-sync-scroll="${{key}}"]`);
+        const inner = topScroll.querySelector(".review-scroll-inner");
+        const table = tableWrap ? tableWrap.querySelector("table") : null;
+        if (!tableWrap || !inner || !table) return;
+        const syncWidth = () => {{ inner.style.width = `${{table.scrollWidth}}px`; }};
+        syncWidth();
+        window.addEventListener("resize", syncWidth);
+        topScroll.addEventListener("scroll", () => {{ tableWrap.scrollLeft = topScroll.scrollLeft; }});
+        tableWrap.addEventListener("scroll", () => {{ topScroll.scrollLeft = tableWrap.scrollLeft; }});
+      }});
     }})();
   </script>
 </body>
@@ -3360,6 +3376,9 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
     .search-actions input {{ min-width: 320px; padding: 9px 10px; }}
     .bulk-count, .search-count {{ font-size: 13px; color: #5f6368; padding: 0 4px 8px; }}
     .table-wrap {{ overflow: auto; border: 1px solid #e3e7ed; border-radius: 14px; background: #fff; }}
+    .review-scroll-top {{ overflow-x: auto; overflow-y: hidden; border: 1px solid #e3e7ed; border-bottom: 0; border-radius: 14px 14px 0 0; background: #fff; height: 18px; }}
+    .review-scroll-inner {{ height: 1px; min-width: 900px; }}
+    .review-table-wrap {{ max-height: 68vh; border-radius: 0 0 14px 14px; }}
     table {{ width: 100%; min-width: {2400 + (160 * len(charge_ledgers))}px; border-collapse: collapse; background: #fff; font-size: 14px; }}
     th, td {{ border-bottom: 1px solid #e8edf3; padding: 9px 10px; text-align: left; vertical-align: top; }}
     th {{ background: #f7f9fc; font-size: 12px; text-transform: uppercase; color: #5f6368; letter-spacing: 0.04em; position: sticky; top: 0; z-index: 1; }}
@@ -3482,8 +3501,9 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
           <button type="button" id="applyBulk">Apply to selected</button>
           <div id="selectedCount" class="bulk-count">0 rows selected</div>
         </div>
-        <div class="table-wrap">
-          <table>
+        <div class="review-scroll-top" data-sync-scroll="billReview"><div class="review-scroll-inner"></div></div>
+        <div class="table-wrap review-table-wrap" data-sync-scroll="billReview">
+          <table class="review-table">
             <thead>
               <tr><th><input type="checkbox" id="selectAllRows" aria-label="Select all rows"></th><th>Source</th><th>Item Name</th><th>HSN/SAC</th><th>Quantity</th><th>Rate</th><th>Item Amount</th>{charge_headers}<th>Voucher No.</th><th>Voucher</th><th>Date</th><th>Party ledger</th><th>Debit ledger</th><th>Credit ledger</th><th>Amount</th><th>CGST</th><th>SGST</th><th>IGST</th><th>Total Amount</th><th>Narration</th><th>Review</th></tr>
             </thead>
@@ -3500,6 +3520,18 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
     const rowChecks = () => Array.from(document.querySelectorAll(".row-check"));
     const entryRows = () => Array.from(document.querySelectorAll(".bill-entry-row"));
     const selectedCount = document.getElementById("selectedCount");
+    document.querySelectorAll(".review-scroll-top").forEach((topScroll) => {{
+      const key = topScroll.dataset.syncScroll;
+      const tableWrap = document.querySelector(`.review-table-wrap[data-sync-scroll="${{key}}"]`);
+      const inner = topScroll.querySelector(".review-scroll-inner");
+      const table = tableWrap ? tableWrap.querySelector("table") : null;
+      if (!tableWrap || !inner || !table) return;
+      const syncWidth = () => {{ inner.style.width = `${{table.scrollWidth}}px`; }};
+      syncWidth();
+      window.addEventListener("resize", syncWidth);
+      topScroll.addEventListener("scroll", () => {{ tableWrap.scrollLeft = topScroll.scrollLeft; }});
+      tableWrap.addEventListener("scroll", () => {{ topScroll.scrollLeft = tableWrap.scrollLeft; }});
+    }});
     const syncSearchState = () => {{
       const query = (billSearch && billSearch.value ? billSearch.value : "").trim().toLowerCase();
       const rows = entryRows();

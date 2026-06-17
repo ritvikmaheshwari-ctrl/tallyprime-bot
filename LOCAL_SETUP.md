@@ -55,7 +55,7 @@ python -m pip install -r requirements.txt
 
 ## Python Libraries Included
 
-`requirements.txt` now includes the main Python-side libraries needed by the bot, including:
+`requirements.txt` now includes the lightweight Python libraries needed by the bot, including:
 
 - pandas
 - openpyxl
@@ -63,11 +63,30 @@ python -m pip install -r requirements.txt
 - pillow
 - pdf2image
 - pypdf
-- easyocr
+
+It does not install EasyOCR by default because EasyOCR also installs heavy AI libraries and can make 8 GB RAM PCs slow.
+
+If the other PC is lagging, use the lightweight setup:
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+If EasyOCR was already installed and the PC is still slow, remove the heavy optional packages:
+
+```powershell
+.venv\Scripts\python.exe -m pip uninstall -y easyocr torch torchvision torchaudio opencv-python opencv-python-headless
+```
+
+Only install the optional OCR fallback if Tesseract is not enough for scanned/photo bills:
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r requirements-ocr-optional.txt
+```
 
 ## Extra Windows Programs Still Needed
 
-Some OCR/PDF features need Windows tools outside Python.
+Some OCR/PDF features need Windows tools outside Python. These are lighter than EasyOCR and are the recommended OCR setup for normal PCs.
 
 Install these on the other PC too:
 

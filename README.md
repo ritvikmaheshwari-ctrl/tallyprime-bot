@@ -90,6 +90,8 @@ http://127.0.0.1:8765/setup
 
 Scanned bills/photos need Tesseract OCR and Poppler installed on Windows. See `LOCAL_SETUP.md`.
 
+For 8 GB RAM PCs, keep the default lightweight `requirements.txt` install. Do not install `requirements-ocr-optional.txt` unless you really need the extra EasyOCR fallback.
+
 ## Outputs
 
 Each run creates a dated folder under `runs/` containing:
