@@ -1,0 +1,6 @@
+# Optional OCR fallback. This is large because it installs EasyOCR and PyTorch.
+# The bot works without this if Tesseract OCR is installed on Windows.
+# Install only if you want an additional OCR fallback:
+#   python -m pip install -r requirements-ocr-optional.txt
+
+easyocr>=1.7,<2

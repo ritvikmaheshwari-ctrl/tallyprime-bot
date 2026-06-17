@@ -1,0 +1,35 @@
+IMPORT MATCH SUMMARY
+Bill vouchers generated: 4392
+Voucher counts: Sales=4392
+Date range: 20250401 to 20260331
+
+Source vs generated XML:
+Source rows: 4392 | XML rows: 4392 | Difference: 0
+Source total: 4763097.00 | XML total: 4763097.00 | Difference: 0.00
+
+Month totals generated:
+202504: rows=380 total=402970.00
+202505: rows=348 total=296270.00
+202506: rows=234 total=162962.00
+202507: rows=156 total=146428.00
+202508: rows=261 total=315096.00
+202509: rows=402 total=513027.00
+202510: rows=443 total=521007.00
+202511: rows=417 total=481133.00
+202512: rows=505 total=547443.00
+202601: rows=431 total=483450.00
+202602: rows=403 total=440378.00
+202603: rows=412 total=452933.00
+
+Tally ledger totals to verify:
+Sales Accounts total: 4763097.00
+Output CGST total: 0.00
+Output SGST total: 0.00
+Output IGST total: 0.00
+GST total: 0.00
+Customer ledger total: 4763097.00
+
+Party totals:
+ESIC: 4763097.00
+
+Note: Sales Accounts does not include GST. Compare the uploaded taxable value with Sales Accounts.

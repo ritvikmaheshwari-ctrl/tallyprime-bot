@@ -1,0 +1,33 @@
+[
+  {
+    "file": "20260617_113242_ESIC.xls",
+    "kind": "multi_sheet_bill_table",
+    "entry_type": "sale",
+    "rows": 4392,
+    "source_rows": 4392,
+    "source_total": 4763097.0,
+    "generated_total": 4763097.0,
+    "sheets": [
+      {
+        "file": "20260617_113242_ESIC_60e1a05b399e4c8eab4a9e56b2af7264.xlsx",
+        "kind": "ledger_register_bill_table",
+        "entry_type": "sale",
+        "rows": 4392,
+        "source_rows": 4392,
+        "source_total": 4763097.0,
+        "generated_total": 4763097.0,
+        "columns": [
+          "Date",
+          "Type",
+          "Particulars",
+          "Debit",
+          "Credit",
+          "Balance"
+        ],
+        "sheet": "Ledger"
+      }
+    ],
+    "converted_from": ".xls",
+    "converted_to": "20260617_113242_ESIC_60e1a05b399e4c8eab4a9e56b2af7264.xlsx"
+  }
+]

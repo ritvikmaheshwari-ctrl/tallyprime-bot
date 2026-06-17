@@ -1,0 +1,55 @@
+{
+  "bill_vouchers_generated": 4392,
+  "voucher_counts": {
+    "Sales": 4392
+  },
+  "date_from": "20250401",
+  "date_to": "20260331",
+  "source_rows": 4392,
+  "source_total": 4763097.0,
+  "xml_rows": 4392,
+  "xml_total": 4763097.0,
+  "month_counts": {
+    "202504": 380,
+    "202505": 348,
+    "202506": 234,
+    "202507": 156,
+    "202508": 261,
+    "202509": 402,
+    "202510": 443,
+    "202511": 417,
+    "202512": 505,
+    "202601": 431,
+    "202602": 403,
+    "202603": 412
+  },
+  "month_totals": {
+    "202504": 402970.0,
+    "202505": 296270.0,
+    "202506": 162962.0,
+    "202507": 146428.0,
+    "202508": 315096.0,
+    "202509": 513027.0,
+    "202510": 521007.0,
+    "202511": 481133.0,
+    "202512": 547443.0,
+    "202601": 483450.0,
+    "202602": 440378.0,
+    "202603": 452933.0
+  },
+  "main_ledger_label": "Sales Accounts",
+  "tax_prefix": "Output",
+  "party_total_label": "Customer ledger total",
+  "main_ledger_total": 4763097.0,
+  "cgst_total": 0.0,
+  "sgst_total": 0.0,
+  "igst_total": 0.0,
+  "gst_total": 0.0,
+  "party_ledger_total": 4763097.0,
+  "party_totals": {
+    "ESIC": 4763097.0
+  },
+  "tally_check_note": "Sales Accounts ledger shows the uploaded taxable total. Customer ledger total is Sales Accounts + Output CGST + Output SGST + Output IGST.",
+  "source_row_difference": 0,
+  "source_total_difference": 0.0
+}

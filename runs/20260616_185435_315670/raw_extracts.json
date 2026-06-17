@@ -1,0 +1,33 @@
+[
+  {
+    "file": "20260616_185402_RGHS.xls",
+    "kind": "multi_sheet_bill_table",
+    "entry_type": "sale",
+    "rows": 327,
+    "source_rows": 327,
+    "source_total": 576110.0,
+    "generated_total": 576110.0,
+    "sheets": [
+      {
+        "file": "20260616_185402_RGHS_e5bb3e54a1f94d40801904089e38b5f3.xlsx",
+        "kind": "ledger_register_bill_table",
+        "entry_type": "sale",
+        "rows": 327,
+        "source_rows": 327,
+        "source_total": 576110.0,
+        "generated_total": 576110.0,
+        "columns": [
+          "Date",
+          "Type",
+          "Particulars",
+          "Debit",
+          "Credit",
+          "Balance"
+        ],
+        "sheet": "Ledger"
+      }
+    ],
+    "converted_from": ".xls",
+    "converted_to": "20260616_185402_RGHS_e5bb3e54a1f94d40801904089e38b5f3.xlsx"
+  }
+]

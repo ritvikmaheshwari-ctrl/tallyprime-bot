@@ -1,0 +1,15 @@
+# TallyPrime Entry Prep Bot Python dependencies
+# Install with:
+#   python -m pip install -r requirements.txt
+#
+# Notes:
+# - Tesseract OCR and Poppler are still external Windows installs.
+# - easyocr is included so photo/manual bill OCR works better on a fresh PC.
+
+pandas>=2.2,<3
+openpyxl>=3.1,<4
+xlrd>=2.0,<3
+pillow>=10,<12
+pdf2image>=1.17,<2
+pypdf>=4,<6
+easyocr>=1.7,<2

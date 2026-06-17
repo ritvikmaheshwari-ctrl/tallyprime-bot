@@ -1,0 +1,4 @@
+Step 1: Import 1_import_masters.xml with Tally import type set to Masters.
+Step 2: Import 2_import_vouchers.xml with Tally import type set to Transactions/Vouchers.
+Bill vouchers are exported as Purchase/Sales invoice vouchers with stock item name, quantity, unit, and rate.
+Always import from the latest_export folder to avoid using an older downloaded XML by mistake.
