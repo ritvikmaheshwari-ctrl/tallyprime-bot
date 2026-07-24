@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+import zipfile
+import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 import socket
@@ -49,6 +51,47 @@ BILL_LAST_RUN_DIR: Path | None = None
 BANK_LEDGER_NAME = DEFAULT_BANK_LEDGER
 EASYOCR_READER = None
 DATE_PARSE_MODE = "auto"
+
+GST_STATE_NAMES = {
+    "01": "Jammu & Kashmir",
+    "02": "Himachal Pradesh",
+    "03": "Punjab",
+    "04": "Chandigarh",
+    "05": "Uttarakhand",
+    "06": "Haryana",
+    "07": "Delhi",
+    "08": "Rajasthan",
+    "09": "Uttar Pradesh",
+    "10": "Bihar",
+    "11": "Sikkim",
+    "12": "Arunachal Pradesh",
+    "13": "Nagaland",
+    "14": "Manipur",
+    "15": "Mizoram",
+    "16": "Tripura",
+    "17": "Meghalaya",
+    "18": "Assam",
+    "19": "West Bengal",
+    "20": "Jharkhand",
+    "21": "Odisha",
+    "22": "Chhattisgarh",
+    "23": "Madhya Pradesh",
+    "24": "Gujarat",
+    "26": "Dadra & Nagar Haveli and Daman & Diu",
+    "27": "Maharashtra",
+    "29": "Karnataka",
+    "30": "Goa",
+    "31": "Lakshadweep",
+    "32": "Kerala",
+    "33": "Tamil Nadu",
+    "34": "Puducherry",
+    "35": "Andaman & Nicobar Islands",
+    "36": "Telangana",
+    "37": "Andhra Pradesh",
+    "38": "Ladakh",
+    "97": "Other Territory",
+    "99": "Other Country",
+}
 
 
 def stop_other_servers_on_port() -> None:
@@ -153,6 +196,7 @@ class Entry:
     inventory_items: list[dict] = field(default_factory=list)
     charge_lines: list[dict] = field(default_factory=list)
     voucher_number: str = ""
+    party_gstin: str = ""
 
 
 DATE_PATTERNS = [
@@ -234,6 +278,16 @@ def normalize_date(value: object) -> str:
     eight_digit = re.fullmatch(r"(\d{4})(\d{2})(\d{2})", text)
     if eight_digit:
         return f"{eight_digit.group(1)}{eight_digit.group(2)}{eight_digit.group(3)}"
+    iso_date = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", text)
+    if iso_date:
+        try:
+            return datetime(
+                int(iso_date.group(1)),
+                int(iso_date.group(2)),
+                int(iso_date.group(3)),
+            ).strftime("%Y%m%d")
+        except ValueError:
+            return ""
     explicit_numeric = parse_numeric_date_by_mode(text, current_date_parse_mode())
     if explicit_numeric:
         return explicit_numeric
@@ -702,6 +756,8 @@ def infer_bank_ledger_name(text: str) -> str:
             candidate = lines[idx + 1].strip()
             if candidate and not candidate.startswith(":") and "propert" not in candidate.lower():
                 return candidate
+    if "bank of baroda" in text.lower() or "barb0" in text.lower():
+        return "Bank of Baroda"
     if "aubank.in" in text.lower() or "au current account" in text.lower():
         return "AU Bank"
     return DEFAULT_BANK_LEDGER
@@ -832,6 +888,140 @@ def clean_generic_narration(text: str) -> str:
         narration = re.sub(rf"\s*{re.escape(token)}\s*$", "", narration).strip()
     narration = re.sub(r"\s+", " ", narration).strip(" -|:")
     return trim_statement_footer(narration)[:220]
+
+
+def parse_bob_bank_statement_text(path: Path, text: str, bank_ledger_override: str = "") -> tuple[list[Entry], dict] | None:
+    compact = re.sub(r"\s+", " ", text.replace("\u00a0", " ")).strip()
+    header = compact[:4000].lower()
+    if "bank of baroda" not in header:
+        return None
+    if not all(word in header for word in ("withdrawals", "deposits", "balance", "particulars")):
+        return None
+
+    bank_ledger_name = bank_ledger_override.strip() or "Bank of Baroda"
+    amount_re = re.compile(r"((?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d{1,2}))(?:\s*(Cr|Dr))?", re.I)
+    date_re = re.compile(r"(\d{1,2}-\d{1,2}-\d{2})(?!\d)")
+    entries: list[Entry] = []
+    opening_balance = 0.0
+    previous_balance = 0.0
+    have_previous_balance = False
+    closing_balance = 0.0
+    transaction_headers = 0
+    current_date = ""
+
+    def signed_balance(token: str, suffix: str) -> float:
+        value = money(token)
+        return -value if suffix.strip().lower() == "dr" else value
+
+    def clean_bob_narration(segment: str, token_positions: list[tuple[int, int]]) -> str:
+        body = date_re.sub(" ", segment, count=1)
+        if token_positions:
+            body = body[: token_positions[-2][0] if len(token_positions) >= 2 else token_positions[-1][0]]
+        body = re.sub(r"\b(?:Page\s+\d+\s+of\s+\d+|Transaction\s+Details|BANK\s+OF\s+BARODA|Statement\s+of\s+account).*$", "", body, flags=re.I)
+        body = re.sub(r"\s+", " ", body).strip(" -|:")
+        return body[:220]
+
+    def split_bob_line(line: str) -> list[str]:
+        line = re.sub(r"\s+", " ", line.replace("\u00a0", " ")).strip()
+        matches = list(date_re.finditer(line))
+        if not matches:
+            return [line] if line else []
+        parts: list[str] = []
+        prefix = line[: matches[0].start()].strip()
+        if prefix:
+            parts.append(prefix)
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(line)
+            part = line[match.start():end].strip()
+            if part:
+                parts.append(part)
+        return parts
+
+    for raw_line in text.splitlines():
+        for segment in split_bob_line(raw_line):
+            if re.search(r"\b(Page Total|Statement of account|A/C Number|Account Open Date|Note:|Transaction Details|BANK OF BARODA)\b", segment, re.I):
+                continue
+            date_match = date_re.search(segment)
+            if date_match:
+                parsed_date = normalize_numeric_date_text(date_match.group(1))
+                if parsed_date:
+                    current_date = parsed_date
+                segment = segment[date_match.start():].strip()
+            raw_date = current_date
+            amount_matches = [
+                item
+                for item in amount_re.finditer(segment)
+                if len(re.sub(r"\D", "", item.group(1))) <= 10
+            ]
+            if not amount_matches:
+                continue
+            if re.search(r"\bB/F\b", segment, re.I) and len(amount_matches) == 1:
+                opening_balance = signed_balance(amount_matches[-1].group(1), amount_matches[-1].group(2) or "")
+                previous_balance = opening_balance
+                have_previous_balance = True
+                closing_balance = opening_balance
+                continue
+            if len(amount_matches) < 2 or not raw_date:
+                continue
+            balance_match = amount_matches[-1]
+            amount_match = amount_matches[-2]
+            balance = signed_balance(balance_match.group(1), balance_match.group(2) or "")
+            amount_value = money(amount_match.group(1))
+            if not amount_value:
+                continue
+            debit = credit = 0.0
+            if have_previous_balance:
+                change = round(balance - previous_balance, 2)
+                if change == 0:
+                    previous_balance = balance
+                    closing_balance = balance
+                    continue
+                if change and abs(abs(change) - amount_value) > 0.05:
+                    amount_value = abs(change)
+                if change > 0:
+                    credit = amount_value
+                elif change < 0:
+                    debit = amount_value
+            if not (debit or credit):
+                upper = segment.upper()
+                if re.search(r"\b(DEPOSIT|CREDIT|CR)\b|/CR/", upper):
+                    credit = amount_value
+                elif re.search(r"\b(WITHDRAWAL|DEBIT|CHARGES?|PAYMENT|DR)\b|/DR/", upper):
+                    debit = amount_value
+                else:
+                    debit = amount_value
+            voucher_type = "Receipt" if credit else "Payment"
+            narration = clean_bob_narration(segment, [(item.start(), item.end()) for item in amount_matches])
+            entries.append(Entry(
+                source_file=path.name,
+                source_kind="Bank Statement",
+                voucher_type=voucher_type,
+                date=raw_date,
+                party_ledger=DEFAULT_SUSPENSE_LEDGER,
+                debit_ledger=bank_ledger_name if voucher_type == "Receipt" else DEFAULT_SUSPENSE_LEDGER,
+                credit_ledger=DEFAULT_SUSPENSE_LEDGER if voucher_type == "Receipt" else bank_ledger_name,
+                amount=amount_value,
+                narration=narration or f"Imported from {path.name}",
+                confidence="Medium",
+                needs_review="No",
+            ))
+            transaction_headers += 1
+            previous_balance = balance
+            have_previous_balance = True
+            closing_balance = balance
+
+    if not entries:
+        return None
+    return entries, {
+        "file": path.name,
+        "kind": "bob_bank_statement_text",
+        "transaction_headers": transaction_headers,
+        "transactions": len(entries),
+        "opening_balance": opening_balance,
+        "closing_balance": closing_balance,
+        "bank_ledger_name": bank_ledger_name,
+        "preview": text[:1000],
+    }
 
 
 def parse_generic_bank_statement_text(path: Path, text: str, bank_ledger_override: str = "") -> tuple[list[Entry], dict]:
@@ -991,6 +1181,9 @@ def split_inline_transaction_lines(lines: list[str]) -> list[str]:
 
 
 def parse_bank_statement_text(path: Path, text: str, bank_ledger_override: str = "") -> tuple[list[Entry], dict]:
+    bob_statement = parse_bob_bank_statement_text(path, text, bank_ledger_override)
+    if bob_statement is not None:
+        return bob_statement
     if "Withdrawal (Dr.)" in text and "Deposit (Cr.)" in text:
         return parse_numbered_bank_statement_text(path, text, bank_ledger_override)
     lines = split_inline_transaction_lines([line.strip() for line in text.splitlines() if line.strip()])
@@ -1440,16 +1633,120 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
             return ""
         return text
 
+    def consolidate_invoice_entries(entries: list[Entry]) -> list[Entry]:
+        grouped: dict[tuple[str, str, str, str], Entry] = {}
+        unnumbered: list[Entry] = []
+        duplicate_keys: set[tuple[str, str, str, str]] = set()
+        for entry in entries:
+            voucher_number = (entry.voucher_number or "").strip()
+            if not voucher_number:
+                unnumbered.append(entry)
+                continue
+            key = (
+                entry.voucher_type.strip().lower(),
+                entry.date,
+                entry.party_ledger.strip().lower(),
+                voucher_number.lower(),
+            )
+            existing = grouped.get(key)
+            if existing is None:
+                grouped[key] = entry
+                continue
+            duplicate_keys.add(key)
+            existing.amount = round(existing.amount + entry.amount, 2)
+            existing.cgst_amount = round(existing.cgst_amount + entry.cgst_amount, 2)
+            existing.sgst_amount = round(existing.sgst_amount + entry.sgst_amount, 2)
+            existing.igst_amount = round(existing.igst_amount + entry.igst_amount, 2)
+            charge_totals: dict[str, float] = {}
+            for charge in existing.charge_lines + entry.charge_lines:
+                ledger = str(charge.get("ledger", "")).strip()
+                if ledger:
+                    charge_totals[ledger] = round(
+                        charge_totals.get(ledger, 0.0) + float(charge.get("amount", 0) or 0),
+                        2,
+                    )
+            existing.charge_lines = [
+                {"ledger": ledger, "hsn": "", "amount": amount}
+                for ledger, amount in charge_totals.items()
+                if amount
+            ]
+            existing.needs_review = "Yes" if "Yes" in {existing.needs_review, entry.needs_review} else "No"
+            existing.confidence = "Low" if "Low" in {existing.confidence, entry.confidence} else existing.confidence
+        for key in duplicate_keys:
+            entry = grouped[key]
+            charge_total = sum(float(charge.get("amount", 0) or 0) for charge in entry.charge_lines)
+            entry.total_amount = round(
+                entry.amount + entry.cgst_amount + entry.sgst_amount + entry.igst_amount + charge_total,
+                2,
+            )
+        return list(grouped.values()) + unnumbered
+
+    repaired_path: Path | None = None
+
+    def repair_malformed_xlsx(source: Path) -> Path:
+        nonlocal repaired_path
+        if repaired_path is not None and repaired_path.exists():
+            return repaired_path
+        target = TMP_DIR / f"{source.stem}_{source.stat().st_mtime_ns}_repaired.xlsx"
+        if target.exists():
+            repaired_path = target
+            return target
+        namespace_map = {
+            "x14": "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main",
+            "x15": "http://schemas.microsoft.com/office/spreadsheetml/2010/11/main",
+            "xr": "http://schemas.microsoft.com/office/spreadsheetml/2014/revision",
+            "xr2": "http://schemas.microsoft.com/office/spreadsheetml/2015/revision2",
+            "xr3": "http://schemas.microsoft.com/office/spreadsheetml/2016/revision3",
+        }
+        with zipfile.ZipFile(source, "r") as input_zip, zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as output_zip:
+            for item in input_zip.infolist():
+                payload = input_zip.read(item.filename)
+                if item.filename.endswith(".xml"):
+                    text = payload.decode("utf-8", errors="replace")
+                    root_match = re.search(r"<(?:\w+:)?(?:workbook|worksheet|styleSheet|sst)\b[^>]*>", text)
+                    if root_match:
+                        root = root_match.group(0)
+                        declarations: list[str] = []
+                        for prefix in sorted(set(re.findall(r"</?([A-Za-z_][\w.-]*):", text))):
+                            uri = namespace_map.get(prefix)
+                            if uri and not re.search(rf"\bxmlns:{re.escape(prefix)}\s*=", root):
+                                declarations.append(f' xmlns:{prefix}="{uri}"')
+                        if declarations:
+                            patched_root = root[:-1] + "".join(declarations) + ">"
+                            text = text[:root_match.start()] + patched_root + text[root_match.end():]
+                            payload = text.encode("utf-8")
+                output_zip.writestr(item, payload)
+        repaired_path = target
+        return target
+
     def spreadsheet_frame(header: int | None = 0) -> pd.DataFrame:
         if path.suffix.lower() == ".csv":
             return pd.read_csv(path, header=header, dtype=str)
-        return pd.read_excel(path, header=header, dtype=str, sheet_name=sheet_name)
+        try:
+            return pd.read_excel(path, header=header, dtype=str, sheet_name=sheet_name)
+        except Exception as exc:
+            if path.suffix.lower() != ".xlsx" or not re.search(r"namespace prefix|unbound prefix", str(exc), re.I):
+                raise
+            return pd.read_excel(repair_malformed_xlsx(path), header=header, dtype=str, sheet_name=sheet_name)
 
     if path.suffix.lower() in {".xlsx", ".xls"} and sheet_name is None:
         try:
             sheet_names = pd.ExcelFile(path).sheet_names
-        except Exception:
-            sheet_names = []
+        except Exception as exc:
+            if path.suffix.lower() == ".xlsx" and re.search(r"namespace prefix|unbound prefix", str(exc), re.I):
+                try:
+                    sheet_names = pd.ExcelFile(repair_malformed_xlsx(path)).sheet_names
+                except Exception:
+                    sheet_names = []
+            else:
+                sheet_names = []
+        normalized_sheet_names = {str(name).strip().upper() for name in sheet_names}
+        if "B2B" in normalized_sheet_names and normalized_sheet_names.intersection({"CDNR", "CDNRA"}):
+            # GST return exports keep purchase invoices and credit/debit notes in
+            # separate registers. The bill importer represents the main B2B
+            # purchase register; importing CDNR here would reduce Purchase
+            # Accounts and make it disagree with the B2B taxable-value total.
+            sheet_names = [name for name in sheet_names if str(name).strip().upper() == "B2B"]
         all_entries: list[Entry] = []
         raw_sheets: list[dict] = []
         for one_sheet in sheet_names:
@@ -1467,7 +1764,10 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
                 "rows": len(all_entries),
                 "source_rows": sum(int(raw.get("source_rows", raw.get("rows", 0)) or 0) for raw in raw_sheets),
                 "source_total": round(sum(float(raw.get("source_total", 0) or 0) for raw in raw_sheets), 2),
-                "generated_total": round(sum((entry.total_amount or entry.amount) for entry in all_entries), 2),
+                "generated_total": round(sum(
+                    bill_accounting_sign(entry) * (entry.total_amount or entry.amount)
+                    for entry in all_entries
+                ), 2),
                 "sheets": raw_sheets,
             }
         if sheet_names:
@@ -1477,6 +1777,13 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
         for header_idx, row in probe.head(30).iterrows():
             header_values = [clean_cell(value).lower() for value in row.tolist()]
             if "gstin of supplier" not in header_values or "trade/legal name" not in header_values:
+                continue
+            next_header_values = (
+                [clean_cell(value).lower() for value in probe.iloc[int(header_idx) + 1].tolist()]
+                if int(header_idx) + 1 < len(probe)
+                else []
+            )
+            if not any("invoice number" in value or "invoice no" in value for value in header_values + next_header_values):
                 continue
 
             def header_index(names: Iterable[str]) -> int | None:
@@ -1533,7 +1840,10 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
                     sgst_amount=sgst_amount,
                     igst_amount=igst_amount,
                     total_amount=total_amount,
+                    voucher_number=invoice_no[:80],
+                    party_gstin=supplier_gstin.upper()[:15],
                 ))
+            entries = consolidate_invoice_entries(entries)
             return entries, {
                 "file": path.name,
                 "kind": "gstr2b_bill_table",
@@ -1673,15 +1983,64 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
     if ledger_register_result is not None:
         return ledger_register_result
 
+    def unique_headers(headers: list[str]) -> list[str]:
+        seen: dict[str, int] = {}
+        cleaned: list[str] = []
+        for idx, header in enumerate(headers):
+            name = re.sub(r"\s+", " ", clean_cell(header)).strip(" -:|")
+            if not name or name.lower() in {"nan", "none"}:
+                name = f"Column {idx + 1}"
+            key = name.lower()
+            seen[key] = seen.get(key, 0) + 1
+            cleaned.append(name if seen[key] == 1 else f"{name} {seen[key]}")
+        return cleaned
+
+    def flattened_header_frame(probe_frame: pd.DataFrame) -> pd.DataFrame | None:
+        for idx, row in probe_frame.head(25).iterrows():
+            parent_values = [clean_cell(value) for value in row.tolist()]
+            if sum(1 for value in parent_values if header_words.search(value)) < 2:
+                continue
+            next_values = (
+                [clean_cell(value) for value in probe_frame.iloc[int(idx) + 1].tolist()]
+                if int(idx) + 1 < len(probe_frame)
+                else []
+            )
+            child_score = sum(1 for value in next_values if header_words.search(value))
+            use_child_row = child_score >= 2
+            filled_parents: list[str] = []
+            last_parent = ""
+            for value in parent_values:
+                if value:
+                    last_parent = value
+                filled_parents.append(last_parent)
+            headers: list[str] = []
+            for col_idx, parent in enumerate(filled_parents):
+                child = next_values[col_idx] if col_idx < len(next_values) else ""
+                if use_child_row and child:
+                    if parent and parent.lower() != child.lower():
+                        headers.append(f"{parent} {child}")
+                    else:
+                        headers.append(child)
+                else:
+                    headers.append(parent or child)
+            data_start = int(idx) + (2 if use_child_row else 1)
+            flattened = probe_frame.iloc[data_start:].copy()
+            flattened.columns = unique_headers(headers)
+            return flattened
+        return None
+
     df = spreadsheet_frame()
-    header_words = re.compile(r"date|type|particular|debit|credit|balance|party|supplier|customer|vendor|ledger|amount|total|cgst|sgst|igst|central|state|integrated|trade|legal|narration|description|remarks|voucher", re.I)
+    header_words = re.compile(r"date|type|particular|debit|credit|balance|party|supplier|customer|vendor|ledger|amount|total|cgst|sgst|igst|cess|central|state|integrated|trade|legal|narration|description|remarks|voucher|invoice|bill|rate|taxable|tax", re.I)
     recognized = sum(1 for column in df.columns if header_words.search(str(column)))
-    if recognized < 2:
+    flattened_df = flattened_header_frame(probe)
+    if flattened_df is not None and (recognized < 2 or len(flattened_df.columns) >= len(df.columns)):
+        df = flattened_df
+    elif recognized < 2:
         for idx, row in probe.head(15).iterrows():
             values = [str(value).strip() for value in row.tolist()]
             if sum(1 for value in values if header_words.search(value)) >= 2:
                 df = probe.iloc[idx + 1:].copy()
-                df.columns = values
+                df.columns = unique_headers(values)
                 break
     df = df.dropna(how="all")
     entries: list[Entry] = []
@@ -1717,19 +2076,90 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
             amount_words = ("amount", "amt", "tax", "value")
             for name in names:
                 for key_lower, original in lower.items():
-                    if name in key_lower and any(word in key_lower for word in amount_words) and not any(term in key_lower for term in ("rate", "%", "percent", "eligible", "available")):
+                    is_rate_column = bool(re.search(r"\brate\b|%|\bpercent\b|\beligible\b|\bavailable\b", key_lower))
+                    if name in key_lower and any(word in key_lower for word in amount_words) and not is_rate_column:
                         amount = money(row_dict.get(original))
                         if amount:
                             return amount
             for name in names:
                 for key_lower, original in lower.items():
-                    if name in key_lower and not any(term in key_lower for term in ("rate", "%", "percent", "eligible", "available")):
+                    is_rate_column = bool(re.search(r"\brate\b|%|\bpercent\b|\beligible\b|\bavailable\b", key_lower))
+                    if name in key_lower and not is_rate_column:
                         amount = money(row_dict.get(original))
                         if amount:
                             return amount
             return 0.0
 
-        date = normalize_date(pick(["date", "invoice date", "bill date", "voucher date"]))
+        def row_rate_notes() -> list[str]:
+            notes: list[str] = []
+            seen: set[str] = set()
+            for key_lower, original in lower.items():
+                if not re.search(r"\brate\b|%|percent", key_lower):
+                    continue
+                if any(term in key_lower for term in ("interest", "exchange")):
+                    continue
+                value = clean_cell(row_dict.get(original))
+                if not value:
+                    continue
+                label = re.sub(r"\s+", " ", original).strip(" -:|")
+                note = f"{label}: {value}"
+                if note.lower() not in seen:
+                    seen.add(note.lower())
+                    notes.append(note)
+            return notes
+
+        def extra_charge_ledger(column_name: str, is_sale_row: bool) -> str:
+            key = column_name.lower()
+            if "cess" in key:
+                return "Output Cess" if is_sale_row else "Input Cess"
+            if re.search(r"\btcs\b|tax collected", key):
+                return "Output TCS" if is_sale_row else "Input TCS"
+            if re.search(r"\btds\b|tax deducted", key):
+                return "TDS"
+            if "vat" in key:
+                return "Output VAT" if is_sale_row else "Input VAT"
+            if "freight" in key or "fright" in key:
+                return "Freight"
+            if "round" in key or "r/off" in key or "roff" in key:
+                return "Round Off"
+            if "loading" in key or "cutting" in key:
+                return "Loading & Cutting Charges"
+            return normalize_charge_ledger(column_name)
+
+        def extra_charge_lines(is_sale_row: bool) -> list[dict]:
+            skip_terms = (
+                "gstin", "date", "number", "no.", "invoice type", "bill type", "voucher type",
+                "party", "supplier", "customer", "vendor", "ledger", "name", "narration",
+                "description", "remarks", "particular", "hsn", "sac", "quantity", "qty",
+                "rate", "%", "percent", "taxable value", "taxable amount", "basic amount",
+                "sub total", "subtotal", "invoice value", "total amount", "grand total",
+                "net amount", "bill amount", "cgst", "sgst", "igst", "central tax",
+                "state tax", "state/ut tax", "utgst", "integrated tax",
+            )
+            include_terms = (
+                "cess", "tcs", "tds", "vat", "freight", "fright", "loading", "cutting",
+                "round", "r/off", "roff", "packing", "handling", "transport", "courier",
+                "insurance", "labour", "labor", "commission", "discount", "less", "charge",
+                "charges", "expense", "expenses", "other tax", "tax collected", "tax deducted",
+            )
+            lines: list[dict] = []
+            for key_lower, original in lower.items():
+                if not any(term in key_lower for term in include_terms):
+                    continue
+                if any(term in key_lower for term in skip_terms) and not any(term in key_lower for term in ("cess", "tcs", "tds", "vat", "freight", "fright", "loading", "cutting", "round", "r/off", "roff", "discount", "less", "charge", "charges")):
+                    continue
+                amount_value = money(row_dict.get(original))
+                if not amount_value:
+                    continue
+                raw_text = clean_cell(row_dict.get(original))
+                if re.search(r"discount|less|round", key_lower) and "-" not in raw_text and "(" not in raw_text:
+                    amount_value = -abs(amount_value)
+                ledger = extra_charge_ledger(original, is_sale_row)
+                if ledger:
+                    lines.append({"ledger": ledger, "hsn": "", "amount": amount_value})
+            return lines
+
+        date = normalize_date(pick(["invoice date", "bill date", "voucher date", "note date", "document date", "date"]))
         party = pick_ledger([
             "party ledger",
             "supplier ledger",
@@ -1752,7 +2182,17 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
             "vendor",
             "name",
         ]) or DEFAULT_SUSPENSE_LEDGER
-        amount = pick_money(["taxable value", "taxable amount", "basic amount", "sub total", "amount"], ["total", "tax", "cgst", "sgst", "igst", "cess", "rate", "%"])
+        row_entry_type = str(pick(["entry type", "voucher type", "note type", "type"])).strip().lower() or entry_type
+        is_sale_row = "sale" in row_entry_type
+        amount = pick_money(
+            ["taxable value", "taxable amount", "basic amount", "sub total"],
+            ["total", "cgst", "sgst", "igst", "cess", "rate", "%"],
+        )
+        if not amount:
+            amount = pick_money(
+                ["amount"],
+                ["total", "tax", "cgst", "sgst", "igst", "cess", "rate", "%"],
+            )
         cgst_amount = pick_tax(["cgst", "central tax", "central gst"])
         sgst_amount = pick_tax(["sgst", "state/ut tax", "state tax", "utgst", "state gst"])
         igst_amount = pick_tax(["igst", "integrated tax", "integrated gst"])
@@ -1762,14 +2202,49 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
                 cgst_amount = round(gst_guess / 2, 2)
                 sgst_amount = round(gst_guess - cgst_amount, 2)
         gst_amount = round(cgst_amount + sgst_amount + igst_amount, 2)
-        total_amount = pick_money(["total amount", "grand total", "invoice value", "net amount", "bill amount", "total"], ["taxable", "tax amount", "cgst", "sgst", "igst"])
+        charge_lines = extra_charge_lines(is_sale_row)
+        charge_total = round(sum(float(charge.get("amount", 0) or 0) for charge in charge_lines), 2)
+        total_amount = pick_money(
+            ["total amount", "grand total", "invoice value", "note value", "document value", "net amount", "bill amount", "total"],
+            ["taxable", "tax amount", "cgst", "sgst", "igst"],
+        )
         if not total_amount:
-            total_amount = round(amount + gst_amount, 2) if gst_amount else amount
+            total_amount = round(amount + gst_amount + charge_total, 2) if (gst_amount or charge_total) else amount
         if not amount:
-            amount = round(total_amount - gst_amount, 2) if gst_amount else total_amount
+            amount = round(total_amount - gst_amount - charge_total, 2) if (gst_amount or charge_total) else total_amount
+        invoice_no = clean_cell(pick([
+            "invoice number",
+            "invoice no",
+            "invoice #",
+            "bill number",
+            "bill no",
+            "bill #",
+            "voucher number",
+            "voucher no",
+            "note number",
+            "note no",
+            "document number",
+            "document no",
+        ]))
+        party_gstin = clean_cell(pick([
+            "gstin of supplier",
+            "supplier gstin",
+            "party gstin",
+            "customer gstin",
+            "vendor gstin",
+            "gstin/uin",
+            "gstin",
+        ])).upper()
         narration = str(pick(["narration", "description", "remarks", "particular"])).strip() or f"Imported from {path.name}"
-        row_entry_type = str(pick(["entry type", "voucher type", "type"])).strip().lower() or entry_type
-        voucher_type, debit_ledger, credit_ledger = bill_entry_ledgers(row_entry_type, party)
+        if invoice_no and not re.search(r"\b(?:bill|invoice)\s*(?:no|number)?\b", narration, re.I):
+            narration = f"Invoice No. {invoice_no} | {narration}"
+        rate_notes = row_rate_notes()
+        if rate_notes:
+            narration = f"{narration} | " + " | ".join(rate_notes)
+        if entry_type.strip().lower() == "purchase" and "credit note" in row_entry_type:
+            voucher_type, debit_ledger, credit_ledger = "Debit Note", party, "Purchase Accounts"
+        else:
+            voucher_type, debit_ledger, credit_ledger = bill_entry_ledgers(row_entry_type, party)
         voucher_override = str(pick(["voucher type", "voucher"])).strip()
         debit_override = str(pick(["debit ledger", "debit account", "dr ledger", "dr account"])).strip()
         credit_override = str(pick(["credit ledger", "credit account", "cr ledger", "cr account"])).strip()
@@ -1795,16 +2270,20 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
             sgst_amount=sgst_amount,
             igst_amount=igst_amount,
             total_amount=total_amount,
+            charge_lines=charge_lines,
+            voucher_number=invoice_no[:80],
+            party_gstin=party_gstin[:15] if GSTIN_RE.fullmatch(party_gstin) else "",
         ))
     entries = [entry for entry in entries if entry.amount > 0 or entry.date or entry.narration]
+    entries = consolidate_invoice_entries(entries)
     return entries, {
         "file": path.name,
         "kind": "bill_table",
         "entry_type": entry_type,
         "rows": len(entries),
         "source_rows": len(entries),
-        "source_total": round(sum((entry.total_amount or entry.amount) for entry in entries), 2),
-        "generated_total": round(sum((entry.total_amount or entry.amount) for entry in entries), 2),
+        "source_total": round(sum(bill_accounting_sign(entry) * (entry.total_amount or entry.amount) for entry in entries), 2),
+        "generated_total": round(sum(bill_accounting_sign(entry) * (entry.total_amount or entry.amount) for entry in entries), 2),
         "columns": list(df.columns),
     }
 
@@ -1938,6 +2417,8 @@ def process_bill_file(path: Path, entry_type: str = "purchase") -> tuple[list[En
     suffix = path.suffix.lower()
     if suffix in {".pdf", ".txt", ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}:
         text = extract_text_file(path)
+        if is_bank_statement_text(text):
+            return parse_bank_statement_text(path, text, infer_bank_ledger_name(text))
         ledger_register = extract_ledger_register_text(path, text, entry_type)
         if ledger_register is not None:
             return ledger_register
@@ -2028,6 +2509,22 @@ def voucher_amount(entry: Entry) -> float:
     return entry.total_amount if entry.source_kind == "Bill" and entry.total_amount else entry.amount
 
 
+def bill_accounting_sign(entry: Entry) -> int:
+    return -1 if entry.voucher_type in {"Debit Note", "Credit Note", "Purchase Return", "Sales Return"} else 1
+
+
+def bill_component_total(entry: Entry) -> float:
+    item_total = round(sum(float(item.get("amount", 0) or 0) for item in entry.inventory_items), 2)
+    base_amount = item_total or entry.amount
+    charge_total = sum(float(charge.get("amount", 0) or 0) for charge in entry.charge_lines)
+    return round(base_amount + entry.cgst_amount + entry.sgst_amount + entry.igst_amount + charge_total, 2)
+
+
+def bill_rounding_adjustment(entry: Entry) -> float:
+    document_total = voucher_amount(entry)
+    return round(document_total - bill_component_total(entry), 2) if document_total else 0.0
+
+
 def signed_tally_amount(amount: float) -> str:
     return f"{amount:.2f}"
 
@@ -2075,6 +2572,7 @@ def export_entry(entry: Entry) -> Entry:
         inventory_items=list(entry.inventory_items or []),
         charge_lines=list(entry.charge_lines or []),
         voucher_number=(bill_number_from_entry(entry) if entry.source_kind == "Bill" else (entry.voucher_number or "")).strip(),
+        party_gstin=(entry.party_gstin or "").strip().upper(),
     )
 
 
@@ -2244,8 +2742,9 @@ def inventory_voucher_xml(entry: Entry, run_id: str = "") -> str:
 def accounting_bill_voucher_xml(entry: Entry, run_id: str = "") -> str:
     entry = export_entry(entry)
     party_name = (entry.party_ledger or DEFAULT_SUSPENSE_LEDGER).strip() or DEFAULT_SUSPENSE_LEDGER
-    voucher_type = "Sales" if entry.voucher_type == "Sales" else "Purchase"
+    voucher_type = entry.voucher_type if entry.voucher_type in {"Sales", "Purchase", "Debit Note", "Credit Note"} else "Purchase"
     is_sale = voucher_type == "Sales"
+    is_purchase_return = voucher_type == "Debit Note"
     ref_name = bill_reference(entry)
     voucher_number = bill_number_from_entry(entry)
     voucher_number_xml = ""
@@ -2276,29 +2775,37 @@ def accounting_bill_voucher_xml(entry: Entry, run_id: str = "") -> str:
     else:
         total_amount = voucher_amount(entry)
         base_amount = round(abs(total_amount) - abs(tax_total) - abs(charge_total), 2) if total_amount and tax_total else entry.amount
-    total_amount = round(abs(base_amount) + abs(charge_total) + abs(tax_total), 2)
+    calculated_total = round(abs(base_amount) + charge_total + abs(tax_total), 2)
+    source_total = abs(voucher_amount(entry))
+    total_amount = source_total or calculated_total
+    rounding_adjustment = round(total_amount - calculated_total, 2)
     ledger_amounts: list[tuple[str, float, bool]] = []
     if is_sale:
         ledger_amounts.append((party_name, -abs(total_amount), True))
         ledger_amounts.append((entry.credit_ledger, abs(base_amount), False))
+    elif is_purchase_return:
+        ledger_amounts.append((party_name, -abs(total_amount), True))
+        ledger_amounts.append((entry.credit_ledger or "Purchase Accounts", abs(base_amount), False))
     else:
+        ledger_amounts.append((party_name, abs(total_amount), True))
         ledger_amounts.append((entry.debit_ledger, -abs(base_amount), False))
     for charge in entry.charge_lines:
         ledger = str(charge.get("ledger", "")).strip()
         amount = float(charge.get("amount", 0) or 0)
         if ledger and amount:
-            signed = abs(amount) if is_sale else -abs(amount)
+            signed = abs(amount) if (is_sale or is_purchase_return) else -abs(amount)
             if amount < 0:
                 signed = -signed
             ledger_amounts.append((ledger, signed, False))
+    if abs(rounding_adjustment) >= 0.01:
+        direction = 1 if (is_sale or is_purchase_return) else -1
+        ledger_amounts.append(("Round Off", direction * rounding_adjustment, False))
     if entry.cgst_amount:
-        ledger_amounts.append(("Output CGST" if is_sale else "Input CGST", entry.cgst_amount if is_sale else -entry.cgst_amount, False))
+        ledger_amounts.append(("Output CGST" if is_sale else "Input CGST", entry.cgst_amount if (is_sale or is_purchase_return) else -entry.cgst_amount, False))
     if entry.sgst_amount:
-        ledger_amounts.append(("Output SGST" if is_sale else "Input SGST", entry.sgst_amount if is_sale else -entry.sgst_amount, False))
+        ledger_amounts.append(("Output SGST" if is_sale else "Input SGST", entry.sgst_amount if (is_sale or is_purchase_return) else -entry.sgst_amount, False))
     if entry.igst_amount:
-        ledger_amounts.append(("Output IGST" if is_sale else "Input IGST", entry.igst_amount if is_sale else -entry.igst_amount, False))
-    if not is_sale:
-        ledger_amounts.append((party_name, abs(total_amount), True))
+        ledger_amounts.append(("Output IGST" if is_sale else "Input IGST", entry.igst_amount if (is_sale or is_purchase_return) else -entry.igst_amount, False))
     ledger_xml_body = "\n".join(
         accounting_ledger_entry_xml(ledger, amount, is_party=is_party, bill_ref=ref_name if is_party else "")
         for ledger, amount, is_party in ledger_amounts
@@ -2311,6 +2818,8 @@ def accounting_bill_voucher_xml(entry: Entry, run_id: str = "") -> str:
     <EFFECTIVEDATE>{tally_date(entry.date)}</EFFECTIVEDATE>
     <VOUCHERTYPENAME>{xml_text(voucher_type)}</VOUCHERTYPENAME>{voucher_number_xml}
     <PARTYLEDGERNAME>{xml_text(party_name)}</PARTYLEDGERNAME>
+    <PARTYGSTIN>{xml_text(entry.party_gstin)}</PARTYGSTIN>
+    <BASICBASEPARTYNAME>{xml_text(party_name)}</BASICBASEPARTYNAME>
     <PERSISTEDVIEW>Accounting Invoice View</PERSISTEDVIEW>
     <ISINVOICE>Yes</ISINVOICE>
     <NARRATION>{xml_text(narration)}</NARRATION>
@@ -2353,11 +2862,45 @@ def voucher_xml(entry: Entry, run_id: str = "") -> str:
 </TALLYMESSAGE>""".strip()
 
 
-def ledger_xml(name: str, parent: str, billwise: bool = False, opening_balance: float = 0.0, action: str = "Create") -> str:
+def ledger_xml(
+    name: str,
+    parent: str,
+    billwise: bool = False,
+    opening_balance: float = 0.0,
+    action: str = "Create",
+    gstin: str = "",
+) -> str:
     clean_name = html.escape(name.strip())
     clean_parent = html.escape(parent.strip())
     billwise_text = "Yes" if billwise else "No"
     opening_xml = f"\n    <OPENINGBALANCE>-{opening_balance:.2f}</OPENINGBALANCE>" if opening_balance else ""
+    gstin_clean = gstin.strip().upper()
+    gst_xml = ""
+    if GSTIN_RE.fullmatch(gstin_clean):
+        state_name = GST_STATE_NAMES.get(gstin_clean[:2], "")
+        state_text = xml_text(state_name)
+        gst_xml = f"""
+    <COUNTRYNAME>India</COUNTRYNAME>
+    <LEDSTATENAME>{state_text}</LEDSTATENAME>
+    <GSTREGISTRATIONTYPE>Regular</GSTREGISTRATIONTYPE>
+    <PARTYGSTIN>{xml_text(gstin_clean)}</PARTYGSTIN>
+    <LEDMAILINGDETAILS.LIST>
+      <APPLICABLEFROM>20250401</APPLICABLEFROM>
+      <MAILINGNAME>{clean_name}</MAILINGNAME>
+      <COUNTRY>India</COUNTRY>
+      <STATE>{state_text}</STATE>
+    </LEDMAILINGDETAILS.LIST>
+    <LEDGSTREGDETAILS.LIST>
+      <APPLICABLEFROM>20250401</APPLICABLEFROM>
+      <GSTREGISTRATIONTYPE>Regular</GSTREGISTRATIONTYPE>
+      <STATE>{state_text}</STATE>
+      <PARTYGSTIN>{xml_text(gstin_clean)}</PARTYGSTIN>
+      <PLACEOFSUPPLY>{state_text}</PLACEOFSUPPLY>
+      <ISOTHTERRITORYASSESSEE>No</ISOTHTERRITORYASSESSEE>
+      <CONSIDERPURCHASEFOREXPORT>No</CONSIDERPURCHASEFOREXPORT>
+      <ISTRANSPORTER>No</ISTRANSPORTER>
+      <ISCOMMONPARTY>No</ISCOMMONPARTY>
+    </LEDGSTREGDETAILS.LIST>"""
     return f"""
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
   <LEDGER NAME="{clean_name}" ACTION="{html.escape(action)}">
@@ -2365,9 +2908,71 @@ def ledger_xml(name: str, parent: str, billwise: bool = False, opening_balance: 
     <PARENT>{clean_parent}</PARENT>
     <ISBILLWISEON>{billwise_text}</ISBILLWISEON>
     <AFFECTSSTOCK>No</AFFECTSSTOCK>
-    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>{opening_xml}
+    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>{gst_xml}{opening_xml}
   </LEDGER>
 </TALLYMESSAGE>""".strip()
+
+
+def ledger_gstin_update_xml(name: str, gstins: Iterable[str]) -> str:
+    clean_name = html.escape(name.strip())
+    valid_gstins = sorted({
+        str(gstin).strip().upper()
+        for gstin in gstins
+        if GSTIN_RE.fullmatch(str(gstin).strip().upper())
+    })
+    if not valid_gstins:
+        return ""
+    primary_gstin = valid_gstins[0]
+    state_name = GST_STATE_NAMES.get(primary_gstin[:2], "")
+    state_text = xml_text(state_name)
+    registration_xml = "\n".join(
+        f"""    <LEDGSTREGDETAILS.LIST>
+      <APPLICABLEFROM>20250401</APPLICABLEFROM>
+      <GSTREGISTRATIONTYPE>Regular</GSTREGISTRATIONTYPE>
+      <STATE>{xml_text(GST_STATE_NAMES.get(gstin[:2], ""))}</STATE>
+      <PARTYGSTIN>{xml_text(gstin)}</PARTYGSTIN>
+      <PLACEOFSUPPLY>{xml_text(GST_STATE_NAMES.get(gstin[:2], ""))}</PLACEOFSUPPLY>
+      <ISOTHTERRITORYASSESSEE>No</ISOTHTERRITORYASSESSEE>
+      <CONSIDERPURCHASEFOREXPORT>No</CONSIDERPURCHASEFOREXPORT>
+      <ISTRANSPORTER>No</ISTRANSPORTER>
+      <ISCOMMONPARTY>No</ISCOMMONPARTY>
+    </LEDGSTREGDETAILS.LIST>"""
+        for gstin in valid_gstins
+    )
+    return f"""
+<TALLYMESSAGE xmlns:UDF="TallyUDF">
+  <LEDGER NAME="{clean_name}" ACTION="Alter">
+    <NAME>{clean_name}</NAME>
+    <COUNTRYNAME>India</COUNTRYNAME>
+    <LEDSTATENAME>{state_text}</LEDSTATENAME>
+    <GSTREGISTRATIONTYPE>Regular</GSTREGISTRATIONTYPE>
+    <PARTYGSTIN>{xml_text(primary_gstin)}</PARTYGSTIN>
+    <LEDMAILINGDETAILS.LIST>
+      <APPLICABLEFROM>20250401</APPLICABLEFROM>
+      <MAILINGNAME>{clean_name}</MAILINGNAME>
+      <COUNTRY>India</COUNTRY>
+      <STATE>{state_text}</STATE>
+    </LEDMAILINGDETAILS.LIST>
+{registration_xml}
+  </LEDGER>
+</TALLYMESSAGE>""".strip()
+
+
+def validate_gstin_update_xml(xml: str, expected_ledgers: int) -> None:
+    root = ET.fromstring(xml)
+    ledgers = root.findall(".//LEDGER")
+    if len(ledgers) != expected_ledgers:
+        raise ValueError(
+            f"GSTIN update safety check failed: expected {expected_ledgers} ledgers, found {len(ledgers)}."
+        )
+    if root.findall(".//VOUCHER"):
+        raise ValueError("GSTIN update safety check failed: voucher data is not allowed.")
+    for node in root.iter():
+        action = node.attrib.get("ACTION", "")
+        if action and action != "Alter":
+            raise ValueError(f"GSTIN update safety check failed: destructive or unexpected action '{action}'.")
+        if "DELETE" in node.tag.upper():
+            raise ValueError("GSTIN update safety check failed: delete instructions are not allowed.")
 
 
 def unit_xml(symbol: str) -> str:
@@ -2508,12 +3113,30 @@ def write_outputs(entries: list[Entry], raw_extracts: list[dict]) -> Path:
     (run_dir / "raw_extracts.json").write_text(json.dumps(raw_extracts, indent=2), encoding="utf-8")
     bill_entries = [entry for entry in entries if entry.source_kind == "Bill"]
     if bill_entries:
-        taxable_total = round(sum(entry.amount for entry in bill_entries), 2)
-        cgst_total = round(sum(entry.cgst_amount for entry in bill_entries), 2)
-        sgst_total = round(sum(entry.sgst_amount for entry in bill_entries), 2)
-        igst_total = round(sum(entry.igst_amount for entry in bill_entries), 2)
+        taxable_total = round(sum(bill_accounting_sign(entry) * entry.amount for entry in bill_entries), 2)
+        cgst_total = round(sum(bill_accounting_sign(entry) * entry.cgst_amount for entry in bill_entries), 2)
+        sgst_total = round(sum(bill_accounting_sign(entry) * entry.sgst_amount for entry in bill_entries), 2)
+        igst_total = round(sum(bill_accounting_sign(entry) * entry.igst_amount for entry in bill_entries), 2)
         tax_total = round(cgst_total + sgst_total + igst_total, 2)
-        invoice_total = round(taxable_total + tax_total, 2)
+        charge_total = round(sum(
+            bill_accounting_sign(entry) * sum(float(charge.get("amount", 0) or 0) for charge in entry.charge_lines)
+            for entry in bill_entries
+        ), 2)
+        round_off_total = round(sum(
+            bill_accounting_sign(entry) * bill_rounding_adjustment(entry)
+            for entry in bill_entries
+        ), 2)
+        invoice_total = round(taxable_total + tax_total + charge_total + round_off_total, 2)
+        gross_invoice_total = round(sum(
+            (entry.total_amount or entry.amount)
+            for entry in bill_entries
+            if bill_accounting_sign(entry) > 0
+        ), 2)
+        credit_note_total = round(sum(
+            (entry.total_amount or entry.amount)
+            for entry in bill_entries
+            if bill_accounting_sign(entry) < 0
+        ), 2)
         party_totals: dict[str, float] = {}
         voucher_counts: dict[str, int] = {}
         month_totals: dict[str, float] = {}
@@ -2521,12 +3144,13 @@ def write_outputs(entries: list[Entry], raw_extracts: list[dict]) -> Path:
         dates = []
         for entry in bill_entries:
             party = bill_tally_party(entry) or entry.party_ledger or "Suspense"
-            party_totals[party] = round(party_totals.get(party, 0.0) + voucher_amount(entry), 2)
+            signed_total = bill_accounting_sign(entry) * voucher_amount(entry)
+            party_totals[party] = round(party_totals.get(party, 0.0) + signed_total, 2)
             voucher_counts[entry.voucher_type] = voucher_counts.get(entry.voucher_type, 0) + 1
             if entry.date:
                 dates.append(entry.date)
                 month_key = entry.date[:6]
-                month_totals[month_key] = round(month_totals.get(month_key, 0.0) + (entry.total_amount or entry.amount), 2)
+                month_totals[month_key] = round(month_totals.get(month_key, 0.0) + signed_total, 2)
                 month_counts[month_key] = month_counts.get(month_key, 0) + 1
         primary_voucher_type = "Sales" if voucher_counts.get("Sales", 0) >= voucher_counts.get("Purchase", 0) else "Purchase"
         main_ledger_label = "Sales Accounts" if primary_voucher_type == "Sales" else "Purchase Accounts"
@@ -2540,7 +3164,9 @@ def write_outputs(entries: list[Entry], raw_extracts: list[dict]) -> Path:
             "source_rows": int(sum(raw_metric(raw, "source_rows") for raw in raw_extracts)),
             "source_total": round(sum(raw_metric(raw, "source_total") for raw in raw_extracts), 2),
             "xml_rows": len(bill_entries),
-            "xml_total": round(sum((entry.total_amount or entry.amount) for entry in bill_entries), 2),
+            "xml_total": round(sum(bill_accounting_sign(entry) * (entry.total_amount or entry.amount) for entry in bill_entries), 2),
+            "gross_invoice_total": gross_invoice_total,
+            "credit_note_total": credit_note_total,
             "month_counts": dict(sorted(month_counts.items())),
             "month_totals": dict(sorted(month_totals.items())),
             "main_ledger_label": main_ledger_label,
@@ -2551,6 +3177,8 @@ def write_outputs(entries: list[Entry], raw_extracts: list[dict]) -> Path:
             "sgst_total": sgst_total,
             "igst_total": igst_total,
             "gst_total": tax_total,
+            "additional_charge_total": charge_total,
+            "round_off_total": round_off_total,
             "party_ledger_total": invoice_total,
             "party_totals": dict(sorted(party_totals.items())),
             "tally_check_note": (
@@ -2602,6 +3230,8 @@ def write_outputs(entries: list[Entry], raw_extracts: list[dict]) -> Path:
             f"{tax_prefix} SGST total: {sgst_total:.2f}",
             f"{tax_prefix} IGST total: {igst_total:.2f}",
             f"GST total: {tax_total:.2f}",
+            f"Additional charges total: {charge_total:.2f}",
+            f"Round Off total: {round_off_total:.2f}",
             f"{party_total_label}: {invoice_total:.2f}",
             "",
             "Party totals:",
@@ -2635,6 +3265,7 @@ def write_outputs(entries: list[Entry], raw_extracts: list[dict]) -> Path:
         writer.writerow(reconciliation)
     (run_dir / "reconciliation_summary.json").write_text(json.dumps(reconciliation, indent=2), encoding="utf-8")
     ledger_names: dict[str, str] = {}
+    party_gstins: dict[str, set[str]] = {}
     stock_items: dict[str, dict] = {}
     units: set[str] = set()
     bank_statement_ledgers = {
@@ -2681,6 +3312,9 @@ def write_outputs(entries: list[Entry], raw_extracts: list[dict]) -> Path:
             mapped_party = bill_tally_party(entry)
             if mapped_party:
                 ledger_names[mapped_party] = "Sundry Debtors" if entry.voucher_type == "Sales" else "Sundry Creditors"
+                gstin = (entry.party_gstin or "").strip().upper()
+                if GSTIN_RE.fullmatch(gstin):
+                    party_gstins.setdefault(mapped_party, set()).add(gstin)
             if entry.cgst_amount:
                 ledger_names["Output CGST" if entry.voucher_type == "Sales" else "Input CGST"] = "Duties & Taxes"
             if entry.sgst_amount:
@@ -2690,7 +3324,12 @@ def write_outputs(entries: list[Entry], raw_extracts: list[dict]) -> Path:
             for charge in entry.charge_lines:
                 ledger = str(charge.get("ledger", "")).strip()
                 if ledger:
-                    ledger_names[ledger] = "Indirect Expenses" if ledger.lower() != "round off" else "Indirect Expenses"
+                    if re.search(r"\b(input|output)\s+(cess|tcs|tds|vat)|\b(tcs|tds|vat|cess)\b|tax", ledger, re.I):
+                        ledger_names[ledger] = "Duties & Taxes"
+                    else:
+                        ledger_names[ledger] = "Indirect Expenses"
+            if abs(bill_rounding_adjustment(entry)) >= 0.01:
+                ledger_names["Round Off"] = "Indirect Expenses"
             for item in entry.inventory_items:
                 name = str(item.get("name", "")).strip()
                 if name:
@@ -2704,8 +3343,14 @@ def write_outputs(entries: list[Entry], raw_extracts: list[dict]) -> Path:
             parent,
             billwise=parent in {"Sundry Creditors", "Sundry Debtors"},
             opening_balance=opening_balance if name == opening_bank_ledger else 0.0,
+            gstin=sorted(party_gstins.get(name, set()))[0] if party_gstins.get(name) else "",
         )
         for name, parent in sorted(ledger_names.items())
+    )
+    gst_alter_body = "\n".join(
+        ledger_gstin_update_xml(name, gstins)
+        for name, gstins in sorted(party_gstins.items())
+        if name in ledger_names
     )
     inventory_masters_body = "\n".join(
         [unit_xml(unit) for unit in sorted(units)] +
@@ -2714,9 +3359,17 @@ def write_outputs(entries: list[Entry], raw_extracts: list[dict]) -> Path:
     )
     voucher_type_masters_body = "\n".join(
         voucher_type_manual_xml(voucher_type)
-        for voucher_type in sorted({entry.voucher_type for entry in entries if entry.source_kind == "Bill" and entry.voucher_type in {"Sales", "Purchase"}})
+        for voucher_type in sorted({
+            entry.voucher_type
+            for entry in entries
+            if entry.source_kind == "Bill" and entry.voucher_type in {"Sales", "Purchase", "Debit Note", "Credit Note"}
+        })
     )
-    masters_body = "\n".join(part for part in (ledger_masters_body, inventory_masters_body, voucher_type_masters_body) if part)
+    masters_body = "\n".join(
+        part
+        for part in (ledger_masters_body, inventory_masters_body, voucher_type_masters_body)
+        if part
+    )
     masters_xml = f"""<ENVELOPE>
   <HEADER>
     <TALLYREQUEST>Import Data</TALLYREQUEST>
@@ -2725,6 +3378,9 @@ def write_outputs(entries: list[Entry], raw_extracts: list[dict]) -> Path:
     <IMPORTDATA>
       <REQUESTDESC>
         <REPORTNAME>All Masters</REPORTNAME>
+        <STATICVARIABLES>
+          <IMPORTDUPS>@@DUPMODIFY</IMPORTDUPS>
+        </STATICVARIABLES>
       </REQUESTDESC>
       <REQUESTDATA>
 {masters_body}
@@ -2732,9 +3388,38 @@ def write_outputs(entries: list[Entry], raw_extracts: list[dict]) -> Path:
     </IMPORTDATA>
   </BODY>
 </ENVELOPE>
-    """
+"""
     (run_dir / "required_masters.xml").write_text(masters_xml, encoding="utf-8")
     (run_dir / "1_import_masters.xml").write_text(masters_xml, encoding="utf-8")
+    if gst_alter_body:
+        gst_update_xml = f"""<ENVELOPE>
+  <HEADER>
+    <TALLYREQUEST>Import Data</TALLYREQUEST>
+  </HEADER>
+  <BODY>
+    <IMPORTDATA>
+      <REQUESTDESC>
+        <REPORTNAME>All Masters</REPORTNAME>
+        <STATICVARIABLES>
+          <IMPORTDUPS>@@DUPMODIFY</IMPORTDUPS>
+        </STATICVARIABLES>
+      </REQUESTDESC>
+      <REQUESTDATA>
+{gst_alter_body}
+      </REQUESTDATA>
+    </IMPORTDATA>
+  </BODY>
+</ENVELOPE>
+"""
+        validate_gstin_update_xml(gst_update_xml, len(party_gstins))
+        (run_dir / "1A_update_party_gstin.xml").write_text(gst_update_xml, encoding="utf-8")
+        with (run_dir / "gstin_update_check.csv").open("w", newline="", encoding="utf-8-sig") as gst_audit:
+            writer = csv.writer(gst_audit)
+            writer.writerow(["party_ledger", "gstin", "state", "xml_action", "status"])
+            for name, gstins in sorted(party_gstins.items()):
+                for gstin in sorted(gstins):
+                    state_name = GST_STATE_NAMES.get(gstin[:2], "")
+                    writer.writerow([name, gstin, state_name, "Alter", "Ready"])
     if opening_balance:
         update_bank_xml = f"""<ENVELOPE>
   <HEADER>
@@ -2791,6 +3476,7 @@ def write_outputs(entries: list[Entry], raw_extracts: list[dict]) -> Path:
         )
     steps_text = (
         "Step 1: Import 1_import_masters.xml with Tally import type set to Masters.\n"
+        "Step 1A: Import 1A_update_party_gstin.xml as Masters to update GSTIN on existing party ledgers.\n"
         "Step 2: Import 2_import_vouchers.xml with Tally import type set to Transactions/Vouchers.\n"
         "Bill vouchers are exported as Purchase/Sales invoice vouchers with stock item name, quantity, unit, and rate.\n"
         f"{period_line}"
@@ -2868,6 +3554,8 @@ def refresh_latest_export(run_dir: Path) -> None:
     LATEST_EXPORT_DIR.mkdir(exist_ok=True)
     keep_names = {
         "1_import_masters.xml",
+        "1A_update_party_gstin.xml",
+        "gstin_update_check.csv",
         "2_import_vouchers.xml",
         "required_masters.xml",
         "tallyprime_import.xml",
@@ -2920,6 +3608,16 @@ def display_date(date_text: str) -> str:
     if re.fullmatch(r"\d{8}", normalized):
         return f"{normalized[0:4]}-{normalized[4:6]}-{normalized[6:8]}"
     return date_text
+
+
+def form_field_changed(form: dict[str, list[str]], key: str, rendered_value: str) -> bool:
+    return key in form and str(form[key][0]) != str(rendered_value)
+
+
+def signed_form_money(value: object) -> float:
+    text = str(value or "").strip()
+    amount = money(text)
+    return -amount if "-" in text or ("(" in text and ")" in text) else amount
 
 
 def human_date(date_text: str) -> str:
@@ -3029,6 +3727,142 @@ def parse_bill_items_columns(
             "amount": money(amounts[idx] if idx < len(amounts) else ""),
         })
     return parsed or list(existing or [])
+
+
+def update_bill_entry_from_form(
+    entry: Entry,
+    form: dict[str, list[str]],
+    prefix: str,
+    charge_ledgers: list[str],
+) -> Entry:
+    def submitted(field: str, rendered: str) -> str:
+        return str(form.get(prefix + field, [rendered])[0])
+
+    voucher_type_text = submitted("voucher_type", entry.voucher_type)
+    voucher_type = voucher_type_text.strip() or entry.voucher_type
+
+    rendered_date = display_date(entry.date)
+    date_text = submitted("date", rendered_date).strip()
+    date = entry.date if date_text == rendered_date else (normalize_date(date_text) or entry.date)
+
+    party_text = submitted("party_ledger", entry.party_ledger)
+    debit_text = submitted("debit_ledger", entry.debit_ledger)
+    credit_text = submitted("credit_ledger", entry.credit_ledger)
+    party_ledger = party_text.strip() or entry.party_ledger
+    debit_ledger = debit_text.strip() or entry.debit_ledger
+    credit_ledger = credit_text.strip() or entry.credit_ledger
+
+    rendered_voucher_number = bill_number_from_entry(entry)
+    voucher_number = submitted("voucher_number", rendered_voucher_number).strip()
+    narration = submitted("narration", entry.narration).strip()
+
+    amount_text = submitted("amount", f"{entry.amount:.2f}")
+    cgst_text = submitted("cgst_amount", f"{entry.cgst_amount:.2f}")
+    sgst_text = submitted("sgst_amount", f"{entry.sgst_amount:.2f}")
+    igst_text = submitted("igst_amount", f"{entry.igst_amount:.2f}")
+    rendered_total = entry.total_amount or entry.amount
+    total_text = submitted("total_amount", f"{rendered_total:.2f}")
+
+    amount_changed = amount_text != f"{entry.amount:.2f}"
+    cgst_changed = cgst_text != f"{entry.cgst_amount:.2f}"
+    sgst_changed = sgst_text != f"{entry.sgst_amount:.2f}"
+    igst_changed = igst_text != f"{entry.igst_amount:.2f}"
+    total_changed = total_text != f"{rendered_total:.2f}"
+
+    amount_value = signed_form_money(amount_text) if amount_changed else entry.amount
+    cgst_amount = signed_form_money(cgst_text) if cgst_changed else entry.cgst_amount
+    sgst_amount = signed_form_money(sgst_text) if sgst_changed else entry.sgst_amount
+    igst_amount = signed_form_money(igst_text) if igst_changed else entry.igst_amount
+
+    item_fields = {
+        "item_names": format_item_column(entry, "name"),
+        "item_hsns": format_item_column(entry, "hsn"),
+        "item_quantities": format_item_column(entry, "quantity"),
+        "item_rates": format_item_column(entry, "rate"),
+        "item_amounts": format_item_column(entry, "amount"),
+    }
+    item_values = {field: submitted(field, rendered) for field, rendered in item_fields.items()}
+    items_changed = any(item_values[field] != rendered for field, rendered in item_fields.items())
+    inventory_items = (
+        parse_bill_items_columns(
+            item_values["item_names"],
+            item_values["item_hsns"],
+            item_values["item_quantities"],
+            item_values["item_rates"],
+            item_values["item_amounts"],
+            list(entry.inventory_items or []),
+        )
+        if items_changed
+        else [dict(item) for item in entry.inventory_items or []]
+    )
+
+    charge_values: dict[str, float] = {}
+    charges_changed = False
+    for charge_index, ledger_name in enumerate(charge_ledgers):
+        rendered_charge = f"{charge_amount(entry, ledger_name):.2f}"
+        amount_key = f"charge_amount:{charge_index}"
+        ledger_key = f"charge_ledger:{charge_index}"
+        posted_ledger = submitted(ledger_key, ledger_name).strip() or ledger_name
+        posted_amount = submitted(amount_key, rendered_charge)
+        charges_changed = charges_changed or posted_ledger != ledger_name or posted_amount != rendered_charge
+        charge_values[posted_ledger] = signed_form_money(posted_amount)
+    charge_lines = (
+        build_charge_lines_from_values(charge_values, list(entry.charge_lines or []))
+        if charges_changed
+        else [dict(charge) for charge in entry.charge_lines or []]
+    )
+
+    if (items_changed or charges_changed) and inventory_items and not amount_changed:
+        item_total = round(sum(float(item.get("amount", 0) or 0) for item in inventory_items), 2)
+        taxable_charges = round(
+            sum(
+                float(charge.get("amount", 0) or 0)
+                for charge in charge_lines
+                if str(charge.get("ledger", "")).strip().lower() != "round off"
+            ),
+            2,
+        )
+        amount_value = round(item_total + taxable_charges, 2)
+
+    monetary_components_changed = any([
+        amount_changed,
+        cgst_changed,
+        sgst_changed,
+        igst_changed,
+        items_changed,
+        charges_changed,
+    ])
+    if total_changed:
+        total_amount = signed_form_money(total_text)
+    elif monetary_components_changed:
+        item_total = round(sum(float(item.get("amount", 0) or 0) for item in inventory_items), 2)
+        charge_total = round(sum(float(charge.get("amount", 0) or 0) for charge in charge_lines), 2)
+        taxable_base = item_total if inventory_items else amount_value
+        total_amount = round(taxable_base + charge_total + cgst_amount + sgst_amount + igst_amount, 2)
+    else:
+        total_amount = entry.total_amount
+
+    return Entry(
+        source_file=entry.source_file,
+        source_kind=entry.source_kind,
+        voucher_type=voucher_type,
+        date=date,
+        party_ledger=party_ledger,
+        debit_ledger=debit_ledger,
+        credit_ledger=credit_ledger,
+        amount=amount_value,
+        narration=narration[:220],
+        confidence=entry.confidence,
+        needs_review=entry.needs_review,
+        cgst_amount=cgst_amount,
+        sgst_amount=sgst_amount,
+        igst_amount=igst_amount,
+        total_amount=total_amount,
+        inventory_items=inventory_items,
+        charge_lines=charge_lines,
+        voucher_number=voucher_number[:80],
+        party_gstin=entry.party_gstin,
+    )
 
 
 def render_page(message: str = "", run_dir: Path | None = None, entries: list[Entry] | None = None) -> bytes:
@@ -3270,7 +4104,7 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
             prefix = f"bill:{file_id}:{index}"
             item_amount_total = round(sum(float(row.get("amount", 0) or 0) for row in e.inventory_items), 2)
             taxable_charge_total = round(sum(charge_amount(e, ledger) for ledger in charge_ledgers if ledger.strip().lower() != "round off"), 2)
-            amount_display = round(item_amount_total + taxable_charge_total, 2) if item_amount_total else e.amount
+            amount_display = e.amount
             charge_inputs = ""
             for charge_index, ledger in enumerate(charge_ledgers):
                 charge_inputs += f"""
@@ -3326,6 +4160,8 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
         <div class="downloads">
           <a href="/latest_export/review_entries.csv">Review CSV</a>
           <a href="/latest_export/1_import_masters.xml">1. Import Masters XML</a>
+          <a href="/latest_export/1A_update_party_gstin.xml">1A. Update Party GSTIN</a>
+          <a href="/latest_export/gstin_update_check.csv">GSTIN Update Check</a>
           <a href="/runs/{rel}/tallyprime_import.json">Tally JSON</a>
           <a href="/latest_export/2_import_vouchers.xml">2. Import Vouchers XML</a>
           <a href="/latest_export/import_match_summary.txt">Import match summary</a>
@@ -3813,78 +4649,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/update_bills":
             length = int(self.headers.get("Content-Length", "0"))
-            form = parse_qs(self.rfile.read(length).decode("utf-8", errors="ignore"))
+            form = parse_qs(
+                self.rfile.read(length).decode("utf-8", errors="ignore"),
+                keep_blank_values=True,
+            )
             updated = 0
+            charge_ledgers = all_bill_charge_ledgers()
             for file_id, item in BILL_FILES.items():
                 for index, entry in enumerate(item["entries"]):
                     prefix = f"bill:{file_id}:{index}:"
-                    voucher_type = (form.get(prefix + "voucher_type", [entry.voucher_type])[0] or entry.voucher_type).strip()
-                    date_text = (form.get(prefix + "date", [entry.date])[0] or entry.date).strip()
-                    date = date_text if re.fullmatch(r"\d{8}", date_text) else normalize_date(date_text)
-                    party_ledger = (form.get(prefix + "party_ledger", [entry.party_ledger])[0] or DEFAULT_SUSPENSE_LEDGER).strip()
-                    debit_ledger = (form.get(prefix + "debit_ledger", [entry.debit_ledger])[0] or DEFAULT_SUSPENSE_LEDGER).strip()
-                    credit_ledger = (form.get(prefix + "credit_ledger", [entry.credit_ledger])[0] or DEFAULT_SUSPENSE_LEDGER).strip()
-                    voucher_number = (form.get(prefix + "voucher_number", [bill_number_from_entry(entry)])[0] or "").strip()
-                    amount_value = money(form.get(prefix + "amount", [entry.amount])[0]) or entry.amount
-                    cgst_amount = money(form.get(prefix + "cgst_amount", [entry.cgst_amount])[0])
-                    sgst_amount = money(form.get(prefix + "sgst_amount", [entry.sgst_amount])[0])
-                    igst_amount = money(form.get(prefix + "igst_amount", [entry.igst_amount])[0])
-                    tax_total = round(cgst_amount + sgst_amount + igst_amount, 2)
-                    total_amount = money(form.get(prefix + "total_amount", [entry.total_amount or entry.amount])[0])
-                    if not total_amount:
-                        total_amount = round(amount_value + tax_total, 2) if tax_total else amount_value
-                    narration = (form.get(prefix + "narration", [entry.narration])[0] or entry.narration).strip()
-                    charge_values: dict[str, float] = {}
-                    charge_index = 0
-                    while True:
-                        ledger_key = prefix + f"charge_ledger:{charge_index}"
-                        amount_key = prefix + f"charge_amount:{charge_index}"
-                        if ledger_key not in form and amount_key not in form:
-                            break
-                        ledger_name = (form.get(ledger_key, [""])[0] or "").strip()
-                        amount_text = str(form.get(amount_key, ["0"])[0]).strip()
-                        charge_value = money(amount_text)
-                        if "-" in amount_text or "(" in amount_text:
-                            charge_value = -charge_value
-                        if ledger_name:
-                            charge_values[ledger_name] = charge_value
-                        charge_index += 1
-                    inventory_items = parse_bill_items_columns(
-                        form.get(prefix + "item_names", [format_item_column(entry, "name")])[0],
-                        form.get(prefix + "item_hsns", [format_item_column(entry, "hsn")])[0],
-                        form.get(prefix + "item_quantities", [format_item_column(entry, "quantity")])[0],
-                        form.get(prefix + "item_rates", [format_item_column(entry, "rate")])[0],
-                        form.get(prefix + "item_amounts", [format_item_column(entry, "amount")])[0],
-                        list(entry.inventory_items or []),
-                    )
-                    if inventory_items:
-                        item_total = round(sum(float(item.get("amount", 0) or 0) for item in inventory_items), 2)
-                        taxable_charge_total = round(sum(value for ledger, value in charge_values.items() if ledger.strip().lower() != "round off"), 2)
-                        amount_value = round(item_total + taxable_charge_total, 2)
-                    charge_lines = build_charge_lines_from_values(charge_values, list(entry.charge_lines or []))
-                    charge_total = round(sum(float(charge.get("amount", 0) or 0) for charge in charge_lines), 2)
-                    computed_total = round(amount_value + tax_total + charge_total, 2)
-                    if not total_amount or abs(total_amount - computed_total) > 0.01:
-                        total_amount = computed_total
-                    item["entries"][index] = Entry(
-                        source_file=entry.source_file,
-                        source_kind=entry.source_kind,
-                        voucher_type=voucher_type,
-                        date=date,
-                        party_ledger=party_ledger,
-                        debit_ledger=debit_ledger,
-                        credit_ledger=credit_ledger,
-                        amount=amount_value,
-                        narration=narration[:220],
-                        confidence="Medium" if date and total_amount else "Low",
-                        needs_review="No" if date and total_amount and debit_ledger and credit_ledger else "Yes",
-                        cgst_amount=cgst_amount,
-                        sgst_amount=sgst_amount,
-                        igst_amount=igst_amount,
-                        total_amount=total_amount,
-                        inventory_items=inventory_items,
-                        charge_lines=charge_lines,
-                        voucher_number=voucher_number[:80],
+                    item["entries"][index] = update_bill_entry_from_form(
+                        entry,
+                        form,
+                        prefix,
+                        charge_ledgers,
                     )
                     updated += 1
             run_dir = rebuild_bill_outputs()
@@ -3954,6 +4732,14 @@ class Handler(BaseHTTPRequestHandler):
                         narration=entry.narration,
                         confidence=entry.confidence,
                         needs_review=entry.needs_review,
+                        cgst_amount=entry.cgst_amount,
+                        sgst_amount=entry.sgst_amount,
+                        igst_amount=entry.igst_amount,
+                        total_amount=entry.total_amount,
+                        inventory_items=list(entry.inventory_items or []),
+                        charge_lines=list(entry.charge_lines or []),
+                        voucher_number=entry.voucher_number,
+                        party_gstin=entry.party_gstin,
                     )
                     updated += 1
             run_dir = rebuild_active_outputs()

@@ -1,33 +1,12 @@
 [
   {
-    "file": "20260617_171551_ESIC.xls",
-    "kind": "multi_sheet_bill_table",
-    "entry_type": "sale",
-    "rows": 4392,
-    "source_rows": 4392,
-    "source_total": 4763097.0,
-    "generated_total": 4763097.0,
-    "sheets": [
-      {
-        "file": "20260617_171551_ESIC_e16b46365fef4c4285f13d3d502f2888.xlsx",
-        "kind": "ledger_register_bill_table",
-        "entry_type": "sale",
-        "rows": 4392,
-        "source_rows": 4392,
-        "source_total": 4763097.0,
-        "generated_total": 4763097.0,
-        "columns": [
-          "Date",
-          "Type",
-          "Particulars",
-          "Debit",
-          "Credit",
-          "Balance"
-        ],
-        "sheet": "Ledger"
-      }
-    ],
-    "converted_from": ".xls",
-    "converted_to": "20260617_171551_ESIC_e16b46365fef4c4285f13d3d502f2888.xlsx"
+    "file": "20260725_004529_DR VIJAY.pdf",
+    "kind": "bob_bank_statement_text",
+    "transaction_headers": 3797,
+    "transactions": 3797,
+    "opening_balance": 849.72,
+    "closing_balance": 294187.69,
+    "bank_ledger_name": "Bank of Baroda",
+    "preview": "BANK OF BARODA              Date   :09-06-2026                                 PANCHSHEEL, RJ              Time   :  16:22:16         ADDRESS: BANK OF BARODA, MAKARWALI ROAD, B BLOCK, ,AJMER,RJ,305004         HELPLINE NO.  :  18005700/18005000   CYBER CRIME HELPLINE : 1930         BRANCH PHONE NO.   :8094015499         MICR CODE: 305012013  IFSC CODE: BARB0PANCHS        Page No:         1----------------------------------------------------------------------------------------------------------------------------------A/C Name        :M/S.   DR VIJAY ENT MEDICALSAddress         :ROOM NO 21 FIRST FOOR DR VIJAY ENT HOSPITAL                 ST STEPHEN CIRCLE MAKARWALI ROADCity            :AJMER       Pin Code  : 305001CKYC Number     :XXXXXXXXXX4092Tel No.         :Nomination Flag :Y                     Nominee Name : MRS DEEPSHIKHA GEHLOTScheme Description :   BOB ADVANTAGE CURRENT ACCOUNTJoint Holders   :DR VIJAY ENT MEDICALS\n----------------------------------------------------------------"
   }
 ]
