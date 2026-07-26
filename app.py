@@ -3865,6 +3865,49 @@ def update_bill_entry_from_form(
     )
 
 
+def update_statement_entry_from_form(entry: Entry, form: dict[str, list[str]], prefix: str) -> Entry:
+    def submitted(field: str, rendered: str) -> str:
+        return str(form.get(prefix + field, [rendered])[0])
+
+    rendered_date = display_date(entry.date)
+    date_text = submitted("date", rendered_date).strip()
+    date = entry.date if date_text == rendered_date else (normalize_date(date_text) or entry.date)
+
+    rendered_amount = f"{entry.amount:.2f}"
+    amount_text = submitted("amount", rendered_amount)
+    amount = signed_form_money(amount_text) if amount_text != rendered_amount else entry.amount
+
+    party_ledger = submitted("party_ledger", entry.party_ledger).strip() or entry.party_ledger
+    debit_ledger = submitted("debit_ledger", entry.debit_ledger).strip() or entry.debit_ledger
+    credit_ledger = submitted("credit_ledger", entry.credit_ledger).strip() or entry.credit_ledger
+    voucher_type = submitted("voucher_type", entry.voucher_type).strip() or entry.voucher_type
+    voucher_number = submitted("voucher_number", entry.voucher_number).strip()
+    narration = submitted("narration", entry.narration).strip()
+    needs_review = submitted("needs_review", entry.needs_review).strip() or entry.needs_review
+
+    return Entry(
+        source_file=entry.source_file,
+        source_kind=entry.source_kind,
+        voucher_type=voucher_type,
+        date=date,
+        party_ledger=party_ledger,
+        debit_ledger=debit_ledger,
+        credit_ledger=credit_ledger,
+        amount=amount,
+        narration=narration[:220],
+        confidence=entry.confidence,
+        needs_review=needs_review,
+        cgst_amount=entry.cgst_amount,
+        sgst_amount=entry.sgst_amount,
+        igst_amount=entry.igst_amount,
+        total_amount=entry.total_amount,
+        inventory_items=[dict(item) for item in entry.inventory_items or []],
+        charge_lines=[dict(charge) for charge in entry.charge_lines or []],
+        voucher_number=voucher_number[:80],
+        party_gstin=entry.party_gstin,
+    )
+
+
 def render_page(message: str = "", run_dir: Path | None = None, entries: list[Entry] | None = None) -> bytes:
     if entries is None:
         entries = active_entries()
@@ -3876,32 +3919,55 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
     if ACTIVE_FILES:
         for file_id, item in ACTIVE_FILES.items():
             for index, e in enumerate(item["entries"]):
-                input_name = f"party_ledger:{file_id}:{index}"
+                prefix = f"entry:{file_id}:{index}"
+                search_text = " ".join([
+                    e.source_file,
+                    e.voucher_number,
+                    e.voucher_type,
+                    e.date,
+                    e.party_ledger,
+                    e.debit_ledger,
+                    e.credit_ledger,
+                    f"{e.amount:.2f}",
+                    e.narration,
+                    e.confidence,
+                    e.needs_review,
+                ])
                 rows_html += f"""
-                <tr>
+                <tr class="entry-row" data-search="{html.escape(search_text.lower())}">
+                  <td><input type="checkbox" class="entry-row-check" aria-label="Select row"></td>
                   <td>{html.escape(e.source_file)}</td>
-                  <td>{html.escape(e.voucher_type)}</td>
-                  <td>{html.escape(e.date)}</td>
-                  <td><input class="ledger-input" name="{html.escape(input_name)}" value="{html.escape(e.party_ledger)}"></td>
-                  <td class="num">{e.amount:.2f}</td>
+                  <td><input class="small-input" name="{prefix}:voucher_number" value="{html.escape(e.voucher_number)}"></td>
+                  <td><input class="small-input" name="{prefix}:voucher_type" value="{html.escape(e.voucher_type)}"></td>
+                  <td><input class="small-input" type="date" name="{prefix}:date" value="{html.escape(display_date(e.date))}"></td>
+                  <td><input class="ledger-input" name="{prefix}:party_ledger" value="{html.escape(e.party_ledger)}"></td>
+                  <td><input class="ledger-input" name="{prefix}:debit_ledger" value="{html.escape(e.debit_ledger)}"></td>
+                  <td><input class="ledger-input" name="{prefix}:credit_ledger" value="{html.escape(e.credit_ledger)}"></td>
+                  <td><input class="amount-input" name="{prefix}:amount" value="{e.amount:.2f}"></td>
+                  <td><input class="narration-input" name="{prefix}:narration" value="{html.escape(e.narration)}"></td>
                   <td>{html.escape(e.confidence)}</td>
-                  <td>{html.escape(e.needs_review)}</td>
+                  <td><input class="small-input" name="{prefix}:needs_review" value="{html.escape(e.needs_review)}"></td>
                 </tr>"""
     elif entries:
         for e in entries:
             rows_html += f"""
             <tr>
+              <td></td>
               <td>{html.escape(e.source_file)}</td>
+              <td>{html.escape(e.voucher_number)}</td>
               <td>{html.escape(e.voucher_type)}</td>
               <td>{html.escape(e.date)}</td>
               <td>{html.escape(e.party_ledger)}</td>
+              <td>{html.escape(e.debit_ledger)}</td>
+              <td>{html.escape(e.credit_ledger)}</td>
               <td class="num">{e.amount:.2f}</td>
+              <td>{html.escape(e.narration)}</td>
               <td>{html.escape(e.confidence)}</td>
               <td>{html.escape(e.needs_review)}</td>
             </tr>"""
     update_button = """
       <div class="table-actions">
-        <button type="submit">Update XML with edited party ledgers</button>
+        <button type="submit">Update XML with edited entries</button>
       </div>""" if ACTIVE_FILES else ""
     links = ""
     if run_dir:
@@ -3970,6 +4036,11 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
     .danger:hover {{ background: #a50e0e; }}
     .inline-form {{ display: inline; }}
     .table-actions {{ display: flex; justify-content: flex-end; margin: 0 0 12px; }}
+    .bulk-actions, .search-actions {{ display: flex; flex-wrap: wrap; align-items: end; gap: 12px; background: #f8fafc; border: 1px solid #e3e7ed; border-radius: 14px; padding: 14px; margin: 0 0 12px; }}
+    .bulk-actions label, .search-actions label {{ display: grid; gap: 4px; font-size: 12px; color: #5f6368; text-transform: uppercase; }}
+    .bulk-actions input, .bulk-actions select {{ min-width: 180px; padding: 9px 10px; }}
+    .search-actions input {{ min-width: 360px; padding: 9px 10px; }}
+    .bulk-count, .search-count {{ font-size: 13px; color: #5f6368; padding: 0 4px 8px; }}
     .message {{ color: #0b6b35; font-weight: 700; margin-bottom: 14px; padding: 12px 14px; background: #e6f4ea; border: 1px solid #b7dfc3; border-radius: 12px; }}
     .downloads {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }}
     .downloads a {{ color: #174ea6; background: #eef3fe; text-decoration: none; padding: 10px 12px; border-radius: 999px; font-weight: 600; }}
@@ -3978,9 +4049,14 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
     .review-scroll-inner {{ height: 1px; min-width: 900px; }}
     .review-table-wrap {{ max-height: 68vh; border-radius: 0 0 14px 14px; }}
     table {{ width: 100%; border-collapse: collapse; background: #fff; font-size: 14px; }}
+    .review-table {{ min-width: 1900px; }}
     th, td {{ border-bottom: 1px solid #e8edf3; padding: 11px 12px; text-align: left; vertical-align: top; }}
     th {{ background: #f7f9fc; font-size: 12px; text-transform: uppercase; color: #5f6368; letter-spacing: 0.04em; }}
+    .review-table th {{ position: sticky; top: 0; z-index: 1; }}
     .num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+    .small-input {{ width: 130px; min-width: 130px; padding: 9px 10px; }}
+    .amount-input {{ width: 130px; min-width: 130px; padding: 9px 10px; text-align: right; }}
+    .narration-input {{ width: 280px; min-width: 280px; padding: 9px 10px; }}
     .note {{ font-size: 13px; color: #5f6368; margin-top: 10px; }}
   </style>
 </head>
@@ -4037,13 +4113,39 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
     <section>
       <form action="/update_entries" method="post">
         {update_button}
+        <div class="search-actions">
+          <label>Search entries
+            <input id="entrySearch" placeholder="Search by source, voucher no., party, ledger, amount, narration, date">
+          </label>
+          <div id="entrySearchCount" class="search-count">Showing all rows</div>
+        </div>
+        <div class="bulk-actions">
+          <label>Bulk column
+            <select id="entryBulkColumn">
+              <option value="party_ledger">Party ledger</option>
+              <option value="debit_ledger">Debit ledger</option>
+              <option value="credit_ledger">Credit ledger</option>
+              <option value="voucher_type">Voucher type</option>
+              <option value="voucher_number">Voucher no.</option>
+              <option value="date">Date</option>
+              <option value="amount">Amount</option>
+              <option value="narration">Narration</option>
+              <option value="needs_review">Review</option>
+            </select>
+          </label>
+          <label>New value
+            <input id="entryBulkValue" placeholder="Value for selected rows">
+          </label>
+          <button type="button" id="entryApplyBulk">Apply to selected</button>
+          <div id="entrySelectedCount" class="bulk-count">0 rows selected</div>
+        </div>
         <div class="review-scroll-top" data-sync-scroll="entryReview"><div class="review-scroll-inner"></div></div>
         <div class="table-wrap review-table-wrap" data-sync-scroll="entryReview">
           <table class="review-table">
             <thead>
-              <tr><th>Source</th><th>Voucher</th><th>Date</th><th>Party ledger</th><th>Amount</th><th>Confidence</th><th>Review</th></tr>
+              <tr><th><input type="checkbox" id="entrySelectAllRows" aria-label="Select all rows"></th><th>Source</th><th>Voucher No.</th><th>Voucher</th><th>Date</th><th>Party ledger</th><th>Debit ledger</th><th>Credit ledger</th><th>Amount</th><th>Narration</th><th>Confidence</th><th>Review</th></tr>
             </thead>
-            <tbody>{rows_html or "<tr><td colspan='7'>No entries processed yet.</td></tr>"}</tbody>
+            <tbody>{rows_html or "<tr><td colspan='12'>No entries processed yet.</td></tr>"}</tbody>
           </table>
         </div>
       </form>
@@ -4085,6 +4187,75 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
         topScroll.addEventListener("scroll", () => {{ tableWrap.scrollLeft = topScroll.scrollLeft; }});
         tableWrap.addEventListener("scroll", () => {{ topScroll.scrollLeft = tableWrap.scrollLeft; }});
       }});
+      const entrySearch = document.getElementById("entrySearch");
+      const entrySearchCount = document.getElementById("entrySearchCount");
+      const entrySelectAllRows = document.getElementById("entrySelectAllRows");
+      const entrySelectedCount = document.getElementById("entrySelectedCount");
+      const entryRows = () => Array.from(document.querySelectorAll(".entry-row"));
+      const entryChecks = () => Array.from(document.querySelectorAll(".entry-row-check"));
+      const rowSearchText = (row) => {{
+        const parts = [row.dataset.search || "", row.innerText || row.textContent || ""];
+        row.querySelectorAll("input").forEach((input) => parts.push(input.value || ""));
+        return parts.join(" ").toLowerCase();
+      }};
+      const syncEntrySearch = () => {{
+        const query = (entrySearch && entrySearch.value ? entrySearch.value : "").trim().toLowerCase();
+        let visible = 0;
+        entryRows().forEach((row) => {{
+          const match = !query || rowSearchText(row).includes(query);
+          row.style.display = match ? "" : "none";
+          if (match) visible += 1;
+        }});
+        if (entrySearchCount) {{
+          entrySearchCount.textContent = query
+            ? `${{visible}} matching row${{visible === 1 ? "" : "s"}}`
+            : `${{visible}} row${{visible === 1 ? "" : "s"}} shown`;
+        }}
+      }};
+      const syncEntrySelection = () => {{
+        const checks = entryChecks();
+        const selected = checks.filter((check) => check.checked).length;
+        if (entrySelectedCount) {{
+          entrySelectedCount.textContent = `${{selected}} row${{selected === 1 ? "" : "s"}} selected`;
+        }}
+        if (entrySelectAllRows) {{
+          entrySelectAllRows.checked = checks.length > 0 && selected === checks.length;
+          entrySelectAllRows.indeterminate = selected > 0 && selected < checks.length;
+        }}
+      }};
+      if (entrySearch) {{
+        entrySearch.addEventListener("input", syncEntrySearch);
+      }}
+      if (entrySelectAllRows) {{
+        entrySelectAllRows.addEventListener("change", () => {{
+          entryRows().forEach((row) => {{
+            if (row.style.display === "none") return;
+            const check = row.querySelector(".entry-row-check");
+            if (check) check.checked = entrySelectAllRows.checked;
+          }});
+          syncEntrySelection();
+        }});
+      }}
+      entryChecks().forEach((check) => check.addEventListener("change", syncEntrySelection));
+      const entryApplyBulk = document.getElementById("entryApplyBulk");
+      if (entryApplyBulk) {{
+        entryApplyBulk.addEventListener("click", () => {{
+          const column = document.getElementById("entryBulkColumn").value;
+          const value = document.getElementById("entryBulkValue").value;
+          entryChecks().filter((check) => check.checked).forEach((check) => {{
+            const row = check.closest("tr");
+            const input = row ? row.querySelector(`[name$=":${{column}}"]`) : null;
+            if (input) {{
+              input.value = value;
+              input.dispatchEvent(new Event("input", {{ bubbles: true }}));
+            }}
+          }});
+          syncEntrySearch();
+          syncEntrySelection();
+        }});
+      }}
+      syncEntrySearch();
+      syncEntrySelection();
     }})();
   </script>
 </body>
@@ -4704,43 +4875,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/update_entries":
             length = int(self.headers.get("Content-Length", "0"))
-            form = parse_qs(self.rfile.read(length).decode("utf-8", errors="ignore"))
+            form = parse_qs(
+                self.rfile.read(length).decode("utf-8", errors="ignore"),
+                keep_blank_values=True,
+            )
             updated = 0
-            for key, values in form.items():
-                if not key.startswith("party_ledger:"):
-                    continue
-                _prefix, file_id, index_text = key.split(":", 2)
-                item = ACTIVE_FILES.get(file_id)
-                if not item:
-                    continue
-                try:
-                    index = int(index_text)
-                    entry = item["entries"][index]
-                except (ValueError, IndexError):
-                    continue
-                new_party = (values[0] if values else "").strip() or DEFAULT_SUSPENSE_LEDGER
-                if entry.party_ledger != new_party:
-                    item["entries"][index] = Entry(
-                        source_file=entry.source_file,
-                        source_kind=entry.source_kind,
-                        voucher_type=entry.voucher_type,
-                        date=entry.date,
-                        party_ledger=new_party,
-                        debit_ledger=entry.debit_ledger,
-                        credit_ledger=entry.credit_ledger,
-                        amount=entry.amount,
-                        narration=entry.narration,
-                        confidence=entry.confidence,
-                        needs_review=entry.needs_review,
-                        cgst_amount=entry.cgst_amount,
-                        sgst_amount=entry.sgst_amount,
-                        igst_amount=entry.igst_amount,
-                        total_amount=entry.total_amount,
-                        inventory_items=list(entry.inventory_items or []),
-                        charge_lines=list(entry.charge_lines or []),
-                        voucher_number=entry.voucher_number,
-                        party_gstin=entry.party_gstin,
-                    )
+            for file_id, item in ACTIVE_FILES.items():
+                for index, entry in enumerate(item["entries"]):
+                    prefix = f"entry:{file_id}:{index}:"
+                    item["entries"][index] = update_statement_entry_from_form(entry, form, prefix)
                     updated += 1
             run_dir = rebuild_active_outputs()
             message = f"Updated {updated} entr{'y' if updated == 1 else 'ies'} and regenerated the XML."
