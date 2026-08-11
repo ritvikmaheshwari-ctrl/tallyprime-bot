@@ -758,6 +758,8 @@ def infer_bank_ledger_name(text: str) -> str:
                 return candidate
     if "bank of baroda" in text.lower() or "barb0" in text.lower():
         return "Bank of Baroda"
+    if "icici" in text.lower() or "icic0" in text.lower():
+        return "ICICI Bank"
     if "aubank.in" in text.lower() or "au current account" in text.lower():
         return "AU Bank"
     return DEFAULT_BANK_LEDGER
@@ -1180,10 +1182,149 @@ def split_inline_transaction_lines(lines: list[str]) -> list[str]:
     return split_lines
 
 
+def parse_icici_bank_statement_text(path: Path, text: str, bank_ledger_override: str = "") -> tuple[list[Entry], dict] | None:
+    header = text[:5000].lower()
+    if "icici" not in header and "icic0" not in header:
+        return None
+    if not all(word in header for word in ("transaction", "available", "balance")):
+        return None
+
+    bank_ledger_name = bank_ledger_override.strip() or infer_bank_ledger_name(text)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    start_re = re.compile(r"^\s*(\d{1,5})\s+([A-Z]\d{3,})\s+(\d{1,2}-[A-Za-z]{3}-(?:\d{4})?)\s*(.*)$")
+    amount_re = re.compile(r"(?<!\w)((?:\d{1,3}(?:,\d{2,3})+|\d+)\.\d{2})(?!\w)")
+    blocks: list[list[str]] = []
+    current: list[str] = []
+
+    for line in lines:
+        if start_re.match(line):
+            if current:
+                blocks.append(current)
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        blocks.append(current)
+
+    def is_footer_or_header(line: str) -> bool:
+        return bool(re.search(
+            r"^Generated on\b|^Page \d+\b|^Legends Used\b|^\d+\.\s+[A-Z]{2,}\b|system-generated statement|"
+            r"^S\.no\b|^Transaction\b|^date\b|^Cheque No\b|^Description\b|Withdrawal|Deposit|Available\s+Balance",
+            line,
+            re.I,
+        ))
+
+    def infer_first_direction(description: str) -> str:
+        upper = description.upper()
+        if re.search(r"\b(BY CASH|CASH\s*DEP|PAYMENT FROM|RECD|RECEIVED|DEPOSIT|/CR/)\b", upper):
+            return "Receipt"
+        if re.search(r"\b(CHG|CHGS|CHARGE|GST|FEE|PAID|PAYMENT|PETROL|DIESEL|BILL|/DR/)\b", upper):
+            return "Payment"
+        return "Payment"
+
+    parsed_rows: list[dict] = []
+    for block in blocks:
+        start_match = start_re.match(block[0])
+        if not start_match:
+            continue
+        serial, transaction_id, date_part, first_desc = start_match.groups()
+        cursor = 1
+        if date_part.endswith("-") and cursor < len(block) and re.fullmatch(r"\d{4}", block[cursor]):
+            date_part = f"{date_part}{block[cursor]}"
+            cursor += 1
+        date = normalize_date(date_part)
+        amount_line_index = -1
+        amount_tokens: list[str] = []
+        for idx in range(len(block) - 1, -1, -1):
+            tokens = amount_re.findall(block[idx])
+            if len(tokens) >= 2:
+                amount_line_index = idx
+                amount_tokens = tokens
+                break
+        if amount_line_index < 0:
+            continue
+        amount_value = money(amount_tokens[-2])
+        balance = money(amount_tokens[-1])
+        desc_lines = [first_desc.strip()] if first_desc.strip() else []
+        desc_lines.extend(
+            line
+            for line in block[cursor:amount_line_index]
+            if line and not is_footer_or_header(line)
+        )
+        description = re.sub(r"\s+", " ", " ".join(desc_lines)).strip(" -|")
+        parsed_rows.append({
+            "serial": serial,
+            "transaction_id": transaction_id,
+            "date": date,
+            "description": description,
+            "amount": amount_value,
+            "balance": balance,
+        })
+
+    entries: list[Entry] = []
+    previous_balance = 0.0
+    opening_balance = 0.0
+    closing_balance = 0.0
+    for idx, row in enumerate(parsed_rows):
+        amount_value = float(row["amount"])
+        balance = float(row["balance"])
+        description = str(row["description"])
+        if previous_balance:
+            change = round(balance - previous_balance, 2)
+            if abs(change) >= 0.01:
+                amount_value = abs(change)
+                voucher_type = "Receipt" if change > 0 else "Payment"
+            else:
+                voucher_type = infer_first_direction(description)
+        else:
+            voucher_type = infer_first_direction(description)
+            opening_balance = (
+                round(balance + amount_value, 2)
+                if voucher_type == "Payment"
+                else round(balance - amount_value, 2)
+            )
+        narration_bits = [
+            str(row["transaction_id"]),
+            description,
+        ]
+        narration = " ".join(bit for bit in narration_bits if bit).strip()[:220] or f"Imported from {path.name}"
+        entries.append(Entry(
+            source_file=path.name,
+            source_kind="Bank Statement",
+            voucher_type=voucher_type,
+            date=str(row["date"]),
+            party_ledger=DEFAULT_SUSPENSE_LEDGER,
+            debit_ledger=bank_ledger_name if voucher_type == "Receipt" else DEFAULT_SUSPENSE_LEDGER,
+            credit_ledger=DEFAULT_SUSPENSE_LEDGER if voucher_type == "Receipt" else bank_ledger_name,
+            amount=round(amount_value, 2),
+            narration=narration,
+            confidence="Medium" if row["date"] else "Low",
+            needs_review="No" if row["date"] and amount_value else "Yes",
+        ))
+        previous_balance = balance
+        closing_balance = balance
+
+    if not entries:
+        return None
+    return entries, {
+        "file": path.name,
+        "kind": "icici_bank_statement_text",
+        "transaction_headers": len(blocks),
+        "transactions": len(entries),
+        "opening_balance": opening_balance,
+        "closing_balance": closing_balance,
+        "bank_ledger_name": bank_ledger_name,
+        "preview": text[:1000],
+    }
+
+
 def parse_bank_statement_text(path: Path, text: str, bank_ledger_override: str = "") -> tuple[list[Entry], dict]:
     bob_statement = parse_bob_bank_statement_text(path, text, bank_ledger_override)
     if bob_statement is not None:
         return bob_statement
+    icici_statement = parse_icici_bank_statement_text(path, text, bank_ledger_override)
+    if icici_statement is not None:
+        return icici_statement
     if "Withdrawal (Dr.)" in text and "Deposit (Cr.)" in text:
         return parse_numbered_bank_statement_text(path, text, bank_ledger_override)
     lines = split_inline_transaction_lines([line.strip() for line in text.splitlines() if line.strip()])
