@@ -1673,7 +1673,7 @@ def bill_main_ledger_parent(voucher_type: str, ledger_name: str) -> str:
         return "Fixed Assets"
     if clean in {"expense", "expenses"} or "expense" in clean:
         return "Purchase Accounts" if voucher_type == "Purchase" else "Indirect Expenses"
-    if voucher_type == "Sales":
+    if voucher_type in {"Sales", "Credit Note"}:
         return "Sales Accounts"
     return "Purchase Accounts"
 
@@ -1867,6 +1867,10 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
             return pd.read_excel(path, header=header, dtype=str, sheet_name=sheet_name)
         except Exception as exc:
             if path.suffix.lower() != ".xlsx" or not re.search(r"namespace prefix|unbound prefix", str(exc), re.I):
+                if path.suffix.lower() == ".xls" and re.search(r"xlrd", str(exc), re.I):
+                    raise ValueError(
+                        "This old .xls file needs the xlrd library. Run: python -m pip install -r requirements.txt"
+                    ) from exc
                 raise
             return pd.read_excel(repair_malformed_xlsx(path), header=header, dtype=str, sheet_name=sheet_name)
 
@@ -1882,7 +1886,11 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
             else:
                 sheet_names = []
         normalized_sheet_names = {str(name).strip().upper() for name in sheet_names}
-        if "B2B" in normalized_sheet_names and normalized_sheet_names.intersection({"CDNR", "CDNRA"}):
+        if (
+            entry_type.strip().lower() != "sale"
+            and "B2B" in normalized_sheet_names
+            and normalized_sheet_names.intersection({"CDNR", "CDNRA"})
+        ):
             # GST return exports keep purchase invoices and credit/debit notes in
             # separate registers. The bill importer represents the main B2B
             # purchase register; importing CDNR here would reduce Purchase
@@ -2008,6 +2016,405 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
             }
         return None
 
+    def gstr1_entries(probe: pd.DataFrame) -> tuple[list[Entry], dict] | None:
+        def header_index(header_values: list[str], names: Iterable[str]) -> int | None:
+            for idx, value in enumerate(header_values):
+                text = re.sub(r"\s+", " ", value.lower()).strip()
+                if any(name in text for name in names):
+                    return idx
+            return None
+
+        def rate_header_index(header_values: list[str]) -> int | None:
+            exact_candidates: list[int] = []
+            fallback_candidates: list[int] = []
+            for idx, value in enumerate(header_values):
+                text = re.sub(r"\s+", " ", value.lower()).strip(" -:|")
+                if text in {"rate", "tax rate", "gst rate"}:
+                    exact_candidates.append(idx)
+                elif "rate" in text and "applicable" not in text:
+                    fallback_candidates.append(idx)
+            return (exact_candidates or fallback_candidates or [None])[0]
+
+        def column_value(values: list[object], idx: int | None) -> object:
+            return values[idx] if idx is not None and idx < len(values) else ""
+
+        def rate_value(value: object) -> float:
+            text = clean_cell(value).replace("%", "").strip()
+            return money(text)
+
+        def place_state_code(value: object) -> str:
+            text = clean_cell(value)
+            match = re.search(r"\b(\d{2})\b", text)
+            if match:
+                return match.group(1)
+            for code, state in GST_STATE_NAMES.items():
+                if state and state.lower() in text.lower():
+                    return code
+            return ""
+
+        def split_tax_for_sales(taxable: float, rate: float, party_gstin: str, place_supply: str) -> tuple[float, float, float]:
+            tax_total = round(taxable * rate / 100, 2) if taxable and rate else 0.0
+            if not tax_total:
+                return 0.0, 0.0, 0.0
+            state_code = place_state_code(place_supply) or (party_gstin[:2] if GSTIN_RE.fullmatch(party_gstin) else "")
+            # This bot is used for Rajasthan companies. GSTR-1 gives the buyer
+            # state/place of supply, so 08 means local sale; other states mean IGST.
+            if state_code and state_code != "08":
+                return 0.0, 0.0, tax_total
+            cgst = round(tax_total / 2, 2)
+            return cgst, round(tax_total - cgst, 2), 0.0
+
+        for header_idx, row in probe.head(40).iterrows():
+            header_values = [clean_cell(value).lower() for value in row.tolist()]
+            next_header_values = (
+                [clean_cell(value).lower() for value in probe.iloc[int(header_idx) + 1].tolist()]
+                if int(header_idx) + 1 < len(probe)
+                else []
+            )
+            compact_gstr1_register = (
+                any(value == "gstin" for value in header_values)
+                and any(value in {"desc", "description", "party", "party name", "customer", "customer name"} for value in header_values)
+            )
+            has_recipient_gstin = any(
+                ("gstin" in value and ("recipient" in value or "receiver" in value or "uin" in value))
+                for value in header_values
+            ) or compact_gstr1_register
+            has_invoice = any(
+                (("invoice" in value or "note" in value or "document" in value) and ("number" in value or "no" in value))
+                for value in header_values
+            )
+            has_taxable = any("taxable" in value for value in header_values)
+            if not (has_recipient_gstin and has_invoice and has_taxable):
+                continue
+
+            gstin_idx = header_index(header_values, [
+                "gstin/uin of recipient",
+                "gstin uin of recipient",
+                "gstin of recipient",
+                "gstin/uin",
+                "recipient gstin",
+                "receiver gstin",
+                "gstin",
+            ])
+            party_idx = header_index(header_values, [
+                "receiver name",
+                "recipient name",
+                "trade/legal name",
+                "trade name",
+                "legal name",
+                "party name",
+                "customer name",
+                "description",
+                "desc",
+                "name",
+            ])
+            invoice_idx = header_index(header_values, [
+                "invoice number",
+                "invoice no",
+                "note number",
+                "note no",
+                "bill number",
+                "bill no",
+                "document number",
+                "document no",
+            ])
+            date_idx = header_index(header_values, [
+                "invoice date",
+                "note date",
+                "bill date",
+                "document date",
+                "date",
+            ])
+            invoice_value_idx = header_index(header_values, [
+                "invoice value",
+                "note value",
+                "total amount",
+                "grand total",
+                "bill amount",
+                "net amount",
+            ])
+            summary_amount_idx = next(
+                (
+                    idx
+                    for idx, value in enumerate(header_values)
+                    if re.sub(r"\s+", " ", value.lower()).strip() == "amount"
+                ),
+                invoice_value_idx,
+            )
+            taxable_idx = header_index(header_values, [
+                "taxable value",
+                "taxable amount",
+                "basic amount",
+            ])
+            rate_idx = rate_header_index(header_values)
+            place_idx = header_index(header_values, [
+                "place of supply",
+                "pos",
+                "local/ central",
+                "local/central",
+                "state",
+            ])
+
+            def tax_amount_index(names: Iterable[str]) -> int | None:
+                candidates: list[int] = []
+                for idx, value in enumerate(header_values):
+                    text = re.sub(r"\s+", " ", value).strip()
+                    if any(name in text for name in names):
+                        candidates.append(idx)
+                for idx in candidates:
+                    child = next_header_values[idx] if idx < len(next_header_values) else ""
+                    next_child = next_header_values[idx + 1] if idx + 1 < len(next_header_values) else ""
+                    next_parent = header_values[idx + 1] if idx + 1 < len(header_values) else ""
+                    if "amount" in child:
+                        return idx
+                    if not next_parent and "amount" in next_child:
+                        return idx + 1
+                return candidates[0] if candidates else None
+
+            igst_idx = tax_amount_index(["integrated tax", "igst"])
+            cgst_idx = tax_amount_index(["central tax", "cgst"])
+            sgst_idx = tax_amount_index(["state/ut tax", "state tax", "sgst", "utgst"])
+            cess_idx = header_index(header_values, ["cess amount", "cess"])
+
+            child_header_count = sum(
+                1 for value in next_header_values if value in {"amount", "%age", "percentage", "rate"}
+            )
+            data_start = int(header_idx) + (2 if child_header_count >= 2 else 1)
+            groups: dict[tuple[str, str, str, str], dict] = {}
+            current: dict | None = None
+            credit_note_section = False
+            current_section = ""
+            source_summaries: dict[str, dict[str, float]] = {}
+            source_rows = 0
+            summary_pattern = re.compile(
+                r"\b(?:b2b|b2c|nil rated|exempted|export invoices?|tax liability|set/?off tax|gross total|net total)\b",
+                re.I,
+            )
+            for _, data_row in probe.iloc[data_start:].iterrows():
+                values = data_row.tolist()
+                raw_party = clean_cell(column_value(values, party_idx))
+                raw_invoice = clean_cell(column_value(values, invoice_idx))
+                raw_date = column_value(values, date_idx)
+                row_date = normalize_date(raw_date)
+                row_gstin = clean_cell(column_value(values, gstin_idx)).upper()[:15]
+                invoice_value = money(column_value(values, invoice_value_idx))
+                taxable_amount = money(column_value(values, taxable_idx))
+                rate = rate_value(column_value(values, rate_idx))
+                place_supply = clean_cell(column_value(values, place_idx))
+                cgst_amount = money(column_value(values, cgst_idx))
+                sgst_amount = money(column_value(values, sgst_idx))
+                igst_amount = money(column_value(values, igst_idx))
+                cess_amount = money(column_value(values, cess_idx))
+
+                summary_label = re.sub(r"\s+", " ", raw_party.lower()).strip()
+                summary_key = ""
+                if summary_label == "b2b":
+                    summary_key = "b2b"
+                    current_section = "b2b"
+                elif "b2c (large)" in summary_label:
+                    summary_key = "b2c_large"
+                    current_section = "b2c_large"
+                elif "b2c (small)" in summary_label:
+                    summary_key = "b2c_small"
+                    current_section = "b2c_small"
+                elif "nil rated" in summary_label or "exempted" in summary_label:
+                    summary_key = "nil_exempt"
+                    current_section = "nil_exempt"
+                elif "export invoice" in summary_label:
+                    summary_key = "exports"
+                    current_section = "exports"
+                elif "tax liability on advance" in summary_label:
+                    summary_key = "advance_tax"
+                    current_section = "advance_tax"
+                elif "set/off tax on advance" in summary_label or "set off tax on advance" in summary_label:
+                    summary_key = "advance_adjustment"
+                    current_section = "advance_adjustment"
+                elif summary_label == "gross total":
+                    summary_key = "gross"
+                elif "credit/debit note" in summary_label or "refund vouche" in summary_label:
+                    summary_key = "credit_notes"
+                    current_section = "credit_notes"
+                elif summary_label == "net total":
+                    summary_key = "net"
+                if summary_key and not raw_invoice:
+                    source_summaries[summary_key] = {
+                        "invoice_total": money(column_value(values, summary_amount_idx)),
+                        "taxable": taxable_amount,
+                        "cgst": cgst_amount,
+                        "sgst": sgst_amount,
+                        "igst": igst_amount,
+                        "cess": cess_amount,
+                    }
+
+                if re.search(r"credit/debit note|refund voucher", raw_party, re.I) and not raw_invoice:
+                    credit_note_section = True
+                    current = None
+                    continue
+                if summary_pattern.search(raw_party) and not raw_invoice:
+                    current = None
+                    continue
+
+                if raw_invoice and row_date:
+                    party = usable_ledger_name(raw_party) or DEFAULT_SUSPENSE_LEDGER
+                    voucher_type = "Credit Note" if credit_note_section else "Sales"
+                    key = (voucher_type.lower(), row_date, party.lower(), raw_invoice.lower())
+                    current = groups.setdefault(key, {
+                        "voucher_type": voucher_type,
+                        "date": row_date,
+                        "party": party,
+                        "gstin": row_gstin if GSTIN_RE.fullmatch(row_gstin) else "",
+                        "invoice_no": raw_invoice,
+                        "invoice_value": invoice_value,
+                        "place_supply": place_supply,
+                        "section": current_section,
+                        "rates": set(),
+                        "amount": 0.0,
+                        "cgst": 0.0,
+                        "sgst": 0.0,
+                        "igst": 0.0,
+                        "cess": 0.0,
+                    })
+                    if invoice_value:
+                        current["invoice_value"] = invoice_value
+                    if GSTIN_RE.fullmatch(row_gstin):
+                        current["gstin"] = row_gstin
+                    if place_supply:
+                        current["place_supply"] = place_supply
+                elif current is None:
+                    continue
+
+                if not (taxable_amount or cgst_amount or sgst_amount or igst_amount or cess_amount):
+                    continue
+                source_rows += 1
+                active_gstin = str(current.get("gstin", ""))
+                active_place = str(current.get("place_supply", ""))
+                if not (cgst_amount or sgst_amount or igst_amount) and taxable_amount and rate:
+                    cgst_amount, sgst_amount, igst_amount = split_tax_for_sales(
+                        taxable_amount,
+                        rate,
+                        active_gstin,
+                        active_place,
+                    )
+                current["amount"] = round(float(current["amount"]) + taxable_amount, 2)
+                current["cgst"] = round(float(current["cgst"]) + cgst_amount, 2)
+                current["sgst"] = round(float(current["sgst"]) + sgst_amount, 2)
+                current["igst"] = round(float(current["igst"]) + igst_amount, 2)
+                current["cess"] = round(float(current["cess"]) + cess_amount, 2)
+                if rate:
+                    current["rates"].add(rate)
+
+            entries: list[Entry] = []
+            for group in groups.values():
+                party = str(group["party"])
+                voucher_type = str(group["voucher_type"])
+                component_total = round(
+                    float(group["amount"]) + float(group["cgst"]) + float(group["sgst"])
+                    + float(group["igst"]) + float(group["cess"]),
+                    2,
+                )
+                total_amount = float(group["invoice_value"]) or component_total
+                if voucher_type == "Credit Note":
+                    debit_ledger, credit_ledger = party, "Sales Accounts"
+                else:
+                    _, debit_ledger, credit_ledger = bill_entry_ledgers("sale", party)
+                rate_text = ", ".join(f"{value:g}" for value in sorted(group["rates"]))
+                narration_bits = [
+                    f"Invoice No. {group['invoice_no']}",
+                    f"GSTIN {group['gstin']}" if group["gstin"] else "",
+                    f"Place of Supply {group['place_supply']}" if group["place_supply"] else "",
+                    f"Rate (%): {rate_text}" if rate_text else "",
+                    f"Imported from {path.name}",
+                ]
+                balanced = abs(total_amount - component_total) <= 1.0
+                entries.append(Entry(
+                    source_file=path.name,
+                    source_kind="Bill",
+                    voucher_type=voucher_type,
+                    date=str(group["date"]),
+                    party_ledger=party,
+                    debit_ledger=debit_ledger,
+                    credit_ledger=credit_ledger,
+                    amount=float(group["amount"]),
+                    narration=" | ".join(bit for bit in narration_bits if bit)[:220],
+                    confidence="Medium" if balanced and party != DEFAULT_SUSPENSE_LEDGER else "Low",
+                    needs_review="No" if balanced and party != DEFAULT_SUSPENSE_LEDGER else "Yes",
+                    cgst_amount=float(group["cgst"]),
+                    sgst_amount=float(group["sgst"]),
+                    igst_amount=float(group["igst"]),
+                    total_amount=total_amount,
+                    charge_lines=[{"ledger": "Output Cess", "hsn": "", "amount": float(group["cess"])}] if group["cess"] else [],
+                    voucher_number=str(group["invoice_no"])[:80],
+                    party_gstin=str(group["gstin"]),
+                ))
+            if not entries:
+                continue
+
+            def generated_summary(section: str) -> dict[str, float]:
+                selected = [
+                    entry
+                    for entry, group in zip(entries, groups.values())
+                    if section == "net"
+                    or (section == "gross" and entry.voucher_type != "Credit Note")
+                    or (section == "credit_notes" and entry.voucher_type == "Credit Note")
+                    or str(group.get("section", "")) == section
+                ]
+                signs = [
+                    -1.0 if section == "net" and entry.voucher_type == "Credit Note" else 1.0
+                    for entry in selected
+                ]
+                return {
+                    "invoice_total": round(sum(sign * (entry.total_amount or entry.amount) for sign, entry in zip(signs, selected)), 2),
+                    "taxable": round(sum(sign * entry.amount for sign, entry in zip(signs, selected)), 2),
+                    "cgst": round(sum(sign * entry.cgst_amount for sign, entry in zip(signs, selected)), 2),
+                    "sgst": round(sum(sign * entry.sgst_amount for sign, entry in zip(signs, selected)), 2),
+                    "igst": round(sum(sign * entry.igst_amount for sign, entry in zip(signs, selected)), 2),
+                    "cess": round(sum(
+                        sign * sum(float(charge.get("amount", 0) or 0) for charge in entry.charge_lines)
+                        for sign, entry in zip(signs, selected)
+                    ), 2),
+                }
+
+            reconciliation: dict[str, dict[str, float]] = {}
+            for section in (
+                "b2b",
+                "b2c_large",
+                "b2c_small",
+                "nil_exempt",
+                "exports",
+                "advance_tax",
+                "advance_adjustment",
+                "gross",
+                "credit_notes",
+                "net",
+            ):
+                expected = source_summaries.get(section)
+                if expected is None:
+                    continue
+                actual = generated_summary(section)
+                reconciliation[section] = {**actual}
+                for metric, expected_value in expected.items():
+                    difference = round(actual.get(metric, 0.0) - expected_value, 2)
+                    if abs(difference) > 0.05:
+                        raise ValueError(
+                            f"GSTR-1 reconciliation failed for {section} {metric}: "
+                            f"source {expected_value:.2f}, generated {actual.get(metric, 0.0):.2f}."
+                        )
+            signed_total = round(sum(bill_accounting_sign(entry) * (entry.total_amount or entry.amount) for entry in entries), 2)
+            return entries, {
+                "file": path.name,
+                "kind": "gstr1_sales_table",
+                "entry_type": "sale",
+                "rows": len(entries),
+                "source_rows": len(entries),
+                "source_line_rows": source_rows,
+                "source_total": signed_total,
+                "generated_total": signed_total,
+                "source_breakdown": source_summaries,
+                "generated_breakdown": reconciliation,
+                "columns": [clean_cell(value) for value in row.tolist()],
+            }
+        return None
+
     def ledger_register_entries(probe: pd.DataFrame) -> tuple[list[Entry], dict] | None:
         def header_index(values: list[str], names: Iterable[str]) -> int | None:
             for idx, value in enumerate(values):
@@ -2117,6 +2524,9 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
         return None
 
     probe = spreadsheet_frame(header=None)
+    gstr1_result = gstr1_entries(probe)
+    if gstr1_result is not None:
+        return gstr1_result
     gstr2b_result = gstr2b_entries(probe)
     if gstr2b_result is not None:
         return gstr2b_result
@@ -2603,7 +3013,7 @@ def process_manual_bill_file(path: Path, entry_type: str = "purchase") -> tuple[
 
 def process_generated_bill_file(path: Path, entry_type: str = "purchase") -> tuple[list[Entry], dict]:
     if path.suffix.lower() in {".csv", ".xlsx", ".xls"}:
-        return [Entry(path.name, "Unsupported", "Journal", "", DEFAULT_SUSPENSE_LEDGER, DEFAULT_SUSPENSE_LEDGER, DEFAULT_SUSPENSE_LEDGER, 0, "Use the Manual bills Excel upload for spreadsheet files.", "Low", "Yes")], {"file": path.name, "kind": "unsupported_generated_bill"}
+        return process_bill_file(path, entry_type)
     return process_bill_file(path, entry_type)
 
 
@@ -2885,7 +3295,9 @@ def accounting_bill_voucher_xml(entry: Entry, run_id: str = "") -> str:
     party_name = (entry.party_ledger or DEFAULT_SUSPENSE_LEDGER).strip() or DEFAULT_SUSPENSE_LEDGER
     voucher_type = entry.voucher_type if entry.voucher_type in {"Sales", "Purchase", "Debit Note", "Credit Note"} else "Purchase"
     is_sale = voucher_type == "Sales"
+    is_sales_return = voucher_type == "Credit Note"
     is_purchase_return = voucher_type == "Debit Note"
+    uses_output_tax = is_sale or is_sales_return
     ref_name = bill_reference(entry)
     voucher_number = bill_number_from_entry(entry)
     voucher_number_xml = ""
@@ -2924,6 +3336,9 @@ def accounting_bill_voucher_xml(entry: Entry, run_id: str = "") -> str:
     if is_sale:
         ledger_amounts.append((party_name, -abs(total_amount), True))
         ledger_amounts.append((entry.credit_ledger, abs(base_amount), False))
+    elif is_sales_return:
+        ledger_amounts.append((party_name, abs(total_amount), True))
+        ledger_amounts.append((entry.credit_ledger or "Sales Accounts", -abs(base_amount), False))
     elif is_purchase_return:
         ledger_amounts.append((party_name, -abs(total_amount), True))
         ledger_amounts.append((entry.credit_ledger or "Purchase Accounts", abs(base_amount), False))
@@ -2942,11 +3357,11 @@ def accounting_bill_voucher_xml(entry: Entry, run_id: str = "") -> str:
         direction = 1 if (is_sale or is_purchase_return) else -1
         ledger_amounts.append(("Round Off", direction * rounding_adjustment, False))
     if entry.cgst_amount:
-        ledger_amounts.append(("Output CGST" if is_sale else "Input CGST", entry.cgst_amount if (is_sale or is_purchase_return) else -entry.cgst_amount, False))
+        ledger_amounts.append(("Output CGST" if uses_output_tax else "Input CGST", entry.cgst_amount if (is_sale or is_purchase_return) else -entry.cgst_amount, False))
     if entry.sgst_amount:
-        ledger_amounts.append(("Output SGST" if is_sale else "Input SGST", entry.sgst_amount if (is_sale or is_purchase_return) else -entry.sgst_amount, False))
+        ledger_amounts.append(("Output SGST" if uses_output_tax else "Input SGST", entry.sgst_amount if (is_sale or is_purchase_return) else -entry.sgst_amount, False))
     if entry.igst_amount:
-        ledger_amounts.append(("Output IGST" if is_sale else "Input IGST", entry.igst_amount if (is_sale or is_purchase_return) else -entry.igst_amount, False))
+        ledger_amounts.append(("Output IGST" if uses_output_tax else "Input IGST", entry.igst_amount if (is_sale or is_purchase_return) else -entry.igst_amount, False))
     ledger_xml_body = "\n".join(
         accounting_ledger_entry_xml(ledger, amount, is_party=is_party, bill_ref=ref_name if is_party else "")
         for ledger, amount, is_party in ledger_amounts
@@ -3035,7 +3450,7 @@ def ledger_xml(
       <APPLICABLEFROM>20250401</APPLICABLEFROM>
       <GSTREGISTRATIONTYPE>Regular</GSTREGISTRATIONTYPE>
       <STATE>{state_text}</STATE>
-      <PARTYGSTIN>{xml_text(gstin_clean)}</PARTYGSTIN>
+      <GSTIN>{xml_text(gstin_clean)}</GSTIN>
       <PLACEOFSUPPLY>{state_text}</PLACEOFSUPPLY>
       <ISOTHTERRITORYASSESSEE>No</ISOTHTERRITORYASSESSEE>
       <CONSIDERPURCHASEFOREXPORT>No</CONSIDERPURCHASEFOREXPORT>
@@ -3071,7 +3486,7 @@ def ledger_gstin_update_xml(name: str, gstins: Iterable[str]) -> str:
       <APPLICABLEFROM>20250401</APPLICABLEFROM>
       <GSTREGISTRATIONTYPE>Regular</GSTREGISTRATIONTYPE>
       <STATE>{xml_text(GST_STATE_NAMES.get(gstin[:2], ""))}</STATE>
-      <PARTYGSTIN>{xml_text(gstin)}</PARTYGSTIN>
+      <GSTIN>{xml_text(gstin)}</GSTIN>
       <PLACEOFSUPPLY>{xml_text(GST_STATE_NAMES.get(gstin[:2], ""))}</PLACEOFSUPPLY>
       <ISOTHTERRITORYASSESSEE>No</ISOTHTERRITORYASSESSEE>
       <CONSIDERPURCHASEFOREXPORT>No</CONSIDERPURCHASEFOREXPORT>
@@ -3435,13 +3850,13 @@ def write_outputs(entries: list[Entry], raw_extracts: list[dict]) -> Path:
                 ledger_names[clean] = "Indirect Expenses"
             elif clean.lower() == "fixed assets":
                 ledger_names[clean] = "Fixed Assets"
-            elif entry.source_kind == "Bill" and clean.lower() == (entry.party_ledger or "").strip().lower() and entry.voucher_type == "Sales":
+            elif entry.source_kind == "Bill" and clean.lower() == (entry.party_ledger or "").strip().lower() and entry.voucher_type in {"Sales", "Credit Note"}:
                 ledger_names[clean] = "Sundry Debtors"
             elif entry.source_kind == "Bill" and clean.lower() == (entry.party_ledger or "").strip().lower():
                 ledger_names[clean] = "Sundry Creditors"
             elif entry.source_kind == "Bill" and clean.lower() == (entry.debit_ledger or "").strip().lower() and entry.voucher_type == "Purchase":
                 ledger_names[clean] = bill_main_ledger_parent(entry.voucher_type, clean)
-            elif entry.source_kind == "Bill" and clean.lower() == (entry.credit_ledger or "").strip().lower() and entry.voucher_type == "Sales":
+            elif entry.source_kind == "Bill" and clean.lower() == (entry.credit_ledger or "").strip().lower() and entry.voucher_type in {"Sales", "Credit Note"}:
                 ledger_names[clean] = bill_main_ledger_parent(entry.voucher_type, clean)
             elif entry.voucher_type == "Receipt":
                 ledger_names[clean] = "Sundry Debtors"
@@ -3452,16 +3867,16 @@ def write_outputs(entries: list[Entry], raw_extracts: list[dict]) -> Path:
         if entry.source_kind == "Bill":
             mapped_party = bill_tally_party(entry)
             if mapped_party:
-                ledger_names[mapped_party] = "Sundry Debtors" if entry.voucher_type == "Sales" else "Sundry Creditors"
+                ledger_names[mapped_party] = "Sundry Debtors" if entry.voucher_type in {"Sales", "Credit Note"} else "Sundry Creditors"
                 gstin = (entry.party_gstin or "").strip().upper()
                 if GSTIN_RE.fullmatch(gstin):
                     party_gstins.setdefault(mapped_party, set()).add(gstin)
             if entry.cgst_amount:
-                ledger_names["Output CGST" if entry.voucher_type == "Sales" else "Input CGST"] = "Duties & Taxes"
+                ledger_names["Output CGST" if entry.voucher_type in {"Sales", "Credit Note"} else "Input CGST"] = "Duties & Taxes"
             if entry.sgst_amount:
-                ledger_names["Output SGST" if entry.voucher_type == "Sales" else "Input SGST"] = "Duties & Taxes"
+                ledger_names["Output SGST" if entry.voucher_type in {"Sales", "Credit Note"} else "Input SGST"] = "Duties & Taxes"
             if entry.igst_amount:
-                ledger_names["Output IGST" if entry.voucher_type == "Sales" else "Input IGST"] = "Duties & Taxes"
+                ledger_names["Output IGST" if entry.voucher_type in {"Sales", "Credit Note"} else "Input IGST"] = "Duties & Taxes"
             for charge in entry.charge_lines:
                 ledger = str(charge.get("ledger", "")).strip()
                 if ledger:
@@ -4556,7 +4971,7 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
           <h2>Computer-generated bills</h2>
           <form action="/bill_upload" method="post" enctype="multipart/form-data">
             <input type="hidden" name="bill_source" value="generated">
-            <input type="file" name="files" multiple accept=".txt,.pdf,.jpg,.jpeg,.png,.bmp,.tif,.tiff,.webp">
+            <input type="file" name="files" multiple accept=".txt,.pdf,.jpg,.jpeg,.png,.bmp,.tif,.tiff,.webp,.csv,.xlsx,.xls">
             <div class="filters">
               <label>Default entry type
                 <select name="entry_type">
@@ -4572,7 +4987,7 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
             </div>
             <button type="submit">Parse bill files</button>
           </form>
-          <p class="note">Use this for PDF, photo, PNG/JPG, or text bill files. OCR values marked Review should be checked before XML import.</p>
+          <p class="note">Use this for PDF, photo, PNG/JPG, text, CSV, XLSX, or XLS files. Spreadsheet files are detected automatically.</p>
           <p class="note">Choose the date format before processing if the bill uses DD-MM-YYYY, MM-DD-YYYY, YYYY-MM-DD, DD-YYYY-MM, MM-YYYY-DD, or YYYY-DD-MM consistently.</p>
           <p class="note">In Tally, import 1. Import Masters XML as Masters, then import 2. Import Vouchers XML as Transactions/Vouchers.</p>
         </div>
