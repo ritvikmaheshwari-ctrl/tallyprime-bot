@@ -1886,11 +1886,18 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
             else:
                 sheet_names = []
         normalized_sheet_names = {str(name).strip().upper() for name in sheet_names}
-        if (
+        gstr2b_register = (
             entry_type.strip().lower() != "sale"
             and "B2B" in normalized_sheet_names
-            and normalized_sheet_names.intersection({"CDNR", "CDNRA"})
-        ):
+            and normalized_sheet_names.intersection({
+                "CDNR",
+                "CDNRA",
+                "B2B-CDNR",
+                "B2B-CDNRA",
+                "ITC AVAILABLE",
+            })
+        )
+        if gstr2b_register:
             # GST return exports keep purchase invoices and credit/debit notes in
             # separate registers. The bill importer represents the main B2B
             # purchase register; importing CDNR here would reduce Purchase
@@ -1935,8 +1942,19 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
             if not any("invoice number" in value or "invoice no" in value for value in header_values + next_header_values):
                 continue
 
+            # GSTR-2B exports use merged two-row headers. For example,
+            # "Invoice Details" is on the first row while "Invoice number",
+            # "Invoice Date", and "Invoice Value" are on the second row.
+            combined_headers = [
+                re.sub(r"\s+", " ", f"{parent} {child}").strip()
+                for parent, child in zip(
+                    header_values,
+                    next_header_values + [""] * max(0, len(header_values) - len(next_header_values)),
+                )
+            ]
+
             def header_index(names: Iterable[str]) -> int | None:
-                for idx, value in enumerate(header_values):
+                for idx, value in enumerate(combined_headers):
                     text = value.strip()
                     if any(text == name or name in text for name in names):
                         return idx
@@ -1971,6 +1989,11 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
                     total_amount = round(amount + gst_amount, 2)
                 if not (date or total_amount or amount):
                     continue
+                if not invoice_no or not date:
+                    raise ValueError(
+                        "GSTR-2B invoice row is missing Invoice number or Invoice Date. "
+                        "Check the workbook's two-row Invoice Details header."
+                    )
                 voucher_type, debit_ledger, credit_ledger = bill_entry_ledgers(entry_type, party)
                 narration_bits = [f"GSTR-2B invoice {invoice_no}" if invoice_no else "", f"GSTIN {supplier_gstin}" if supplier_gstin else ""]
                 entries.append(Entry(
@@ -1990,9 +2013,11 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
                     igst_amount=igst_amount,
                     total_amount=total_amount,
                     voucher_number=invoice_no[:80],
-                    party_gstin=supplier_gstin.upper()[:15],
+                    party_gstin=supplier_gstin.upper()[:15] if GSTIN_RE.fullmatch(supplier_gstin.upper()) else "",
                 ))
             entries = consolidate_invoice_entries(entries)
+            if entries and any(not entry.voucher_number for entry in entries):
+                raise ValueError("GSTR-2B parsing produced a blank voucher number.")
             return entries, {
                 "file": path.name,
                 "kind": "gstr2b_bill_table",
@@ -4749,6 +4774,10 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
       const entrySelectedCount = document.getElementById("entrySelectedCount");
       const entryRows = () => Array.from(document.querySelectorAll(".entry-row"));
       const entryChecks = () => Array.from(document.querySelectorAll(".entry-row-check"));
+      const visibleEntryChecks = () => entryRows()
+        .filter((row) => row.style.display !== "none")
+        .map((row) => row.querySelector(".entry-row-check"))
+        .filter(Boolean);
       const rowSearchText = (row) => {{
         const parts = [row.dataset.search || "", row.innerText || row.textContent || ""];
         row.querySelectorAll("input").forEach((input) => parts.push(input.value || ""));
@@ -4767,16 +4796,19 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
             ? `${{visible}} matching row${{visible === 1 ? "" : "s"}}`
             : `${{visible}} row${{visible === 1 ? "" : "s"}} shown`;
         }}
+        syncEntrySelection();
       }};
       const syncEntrySelection = () => {{
         const checks = entryChecks();
         const selected = checks.filter((check) => check.checked).length;
+        const visibleChecks = visibleEntryChecks();
+        const visibleSelected = visibleChecks.filter((check) => check.checked).length;
         if (entrySelectedCount) {{
           entrySelectedCount.textContent = `${{selected}} row${{selected === 1 ? "" : "s"}} selected`;
         }}
         if (entrySelectAllRows) {{
-          entrySelectAllRows.checked = checks.length > 0 && selected === checks.length;
-          entrySelectAllRows.indeterminate = selected > 0 && selected < checks.length;
+          entrySelectAllRows.checked = visibleChecks.length > 0 && visibleSelected === visibleChecks.length;
+          entrySelectAllRows.indeterminate = visibleSelected > 0 && visibleSelected < visibleChecks.length;
         }}
       }};
       if (entrySearch) {{
@@ -4784,11 +4816,7 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
       }}
       if (entrySelectAllRows) {{
         entrySelectAllRows.addEventListener("change", () => {{
-          entryRows().forEach((row) => {{
-            if (row.style.display === "none") return;
-            const check = row.querySelector(".entry-row-check");
-            if (check) check.checked = entrySelectAllRows.checked;
-          }});
+          visibleEntryChecks().forEach((check) => {{ check.checked = entrySelectAllRows.checked; }});
           syncEntrySelection();
         }});
       }}
@@ -5082,7 +5110,21 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
     const selectAllRows = document.getElementById("selectAllRows");
     const rowChecks = () => Array.from(document.querySelectorAll(".row-check"));
     const entryRows = () => Array.from(document.querySelectorAll(".bill-entry-row"));
+    const visibleRowChecks = () => entryRows()
+      .filter((row) => row.style.display !== "none")
+      .map((row) => row.querySelector(".row-check"))
+      .filter(Boolean);
     const selectedCount = document.getElementById("selectedCount");
+    const billRowSearchText = (row) => {{
+      const parts = [row.dataset.search || "", row.innerText || row.textContent || ""];
+      row.querySelectorAll("input, textarea, select").forEach((field) => {{
+        parts.push(field.value || "");
+        if (field.tagName === "SELECT" && field.selectedOptions.length) {{
+          parts.push(field.selectedOptions[0].text || "");
+        }}
+      }});
+      return parts.join(" ").toLowerCase();
+    }};
     document.querySelectorAll(".review-scroll-top").forEach((topScroll) => {{
       const key = topScroll.dataset.syncScroll;
       const tableWrap = document.querySelector(`.review-table-wrap[data-sync-scroll="${{key}}"]`);
@@ -5100,8 +5142,7 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
       const rows = entryRows();
       let visible = 0;
       rows.forEach((row) => {{
-        const text = (row.innerText || row.textContent || "").toLowerCase();
-        const match = !query || text.includes(query);
+        const match = !query || billRowSearchText(row).includes(query);
         row.style.display = match ? "" : "none";
         if (match) visible += 1;
       }});
@@ -5110,21 +5151,24 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
           ? `${{visible}} matching row${{visible === 1 ? "" : "s"}}`
           : `${{visible}} row${{visible === 1 ? "" : "s"}} shown`;
       }}
+      syncSelectionState();
     }};
     const syncSelectionState = () => {{
       const checks = rowChecks();
       const selected = checks.filter((check) => check.checked).length;
+      const visibleChecks = visibleRowChecks();
+      const visibleSelected = visibleChecks.filter((check) => check.checked).length;
       if (selectedCount) {{
         selectedCount.textContent = `${{selected}} row${{selected === 1 ? "" : "s"}} selected`;
       }}
       if (selectAllRows) {{
-        selectAllRows.checked = checks.length > 0 && selected === checks.length;
-        selectAllRows.indeterminate = selected > 0 && selected < checks.length;
+        selectAllRows.checked = visibleChecks.length > 0 && visibleSelected === visibleChecks.length;
+        selectAllRows.indeterminate = visibleSelected > 0 && visibleSelected < visibleChecks.length;
       }}
     }};
     if (selectAllRows) {{
       selectAllRows.addEventListener("change", () => {{
-        rowChecks().forEach((check) => {{ check.checked = selectAllRows.checked; }});
+        visibleRowChecks().forEach((check) => {{ check.checked = selectAllRows.checked; }});
         syncSelectionState();
       }});
     }}
@@ -5141,8 +5185,12 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
         selected.forEach((check) => {{
           const row = check.closest("tr");
           const input = row ? row.querySelector(`[name$=":${{column}}"]`) : null;
-          if (input) input.value = value;
+          if (input) {{
+            input.value = value;
+            input.dispatchEvent(new Event("input", {{ bubbles: true }}));
+          }}
         }});
+        syncSearchState();
         syncSelectionState();
       }});
     }}
