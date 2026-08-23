@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 import hashlib
 import html
 import json
@@ -14,6 +15,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -48,6 +50,7 @@ ACTIVE_FILES: dict[str, dict] = {}
 LAST_RUN_DIR: Path | None = None
 BILL_FILES: dict[str, dict] = {}
 BILL_LAST_RUN_DIR: Path | None = None
+XML_EDITOR_STATE: dict[str, object] = {}
 BANK_LEDGER_NAME = DEFAULT_BANK_LEDGER
 EASYOCR_READER = None
 DATE_PARSE_MODE = "auto"
@@ -220,6 +223,8 @@ GENERIC_DATE_RE = re.compile(
 GENERIC_TXN_START_RE = re.compile(
     r"^\s*(?:\d+\s+)?(?:\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}|\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4})\b"
 )
+HDFC_TXN_START_RE = re.compile(r"^\s*(\d{2}/\d{2}/\d{2})")
+HDFC_MONEY_RE = re.compile(r"(?<![\w/])(-?(?:\d{1,3}(?:,\d{2,3})+|\d+)\.\d{2})(?!\w)")
 BANK_NON_AMOUNT_RE = re.compile(
     r"reference\s+no|customer|account\s+type|account\s+number|statement|opening\s+balance|closing\s+balance|"
     r"address|ifsc|nominee|website|email|call\s+us|write\s+to\s+us|follow\s+us|page\s+\d+|toll-free|reg\.",
@@ -1088,6 +1093,187 @@ def parse_generic_bank_statement_text(path: Path, text: str, bank_ledger_overrid
     }
 
 
+def parse_hdfc_bank_statement_pdf(
+    path: Path,
+    text: str,
+    bank_ledger_override: str = "",
+) -> tuple[list[Entry], dict] | None:
+    if path.suffix.lower() != ".pdf":
+        return None
+    header_text = text[:8000].upper()
+    if "HDFC BANK" not in header_text:
+        return None
+
+    layout_text = extract_text_pdf_layout(path)
+    layout_upper = layout_text.upper()
+    required_headers = ("CHQ./REF.NO.", "WITHDRAWAL AMT.", "DEPOSIT AMT.", "CLOSING BALANCE")
+    if not all(header in layout_upper for header in required_headers):
+        return None
+
+    header_line = next(
+        (
+            line
+            for line in layout_text.splitlines()
+            if "Withdrawal Amt." in line and "Deposit Amt." in line and "Closing Balance" in line
+        ),
+        "",
+    )
+    if not header_line:
+        return None
+    reference_column = header_line.index("Chq./Ref.No.")
+    withdrawal_column_end = header_line.index("Withdrawal Amt.") + len("Withdrawal Amt.")
+    deposit_column_start = header_line.index("Deposit Amt.")
+    first_amount_boundary = (withdrawal_column_end + deposit_column_start) / 2
+
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in layout_text.splitlines():
+        if HDFC_TXN_START_RE.match(line):
+            if current:
+                blocks.append(current)
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        blocks.append(current)
+
+    footer_or_header = re.compile(
+        r"statement of account|account branch|address|city|state|phone no|email|cust id|account no|"
+        r"a/c open date|account status|joint holders|nomination|od limit|currency|hdfc bank|"
+        r"withdrawal amt|deposit amt|closing balance|chq\./ref|value dt|^page no\.|^from\s*:|^to\s*:|"
+        r"opening\s+balance|statement summary|generated on|this is a computer generated|registered office|"
+        r"contents of this statement|please examine|end of statement",
+        re.I,
+    )
+
+    parsed_rows: list[dict] = []
+    for block_number, block in enumerate(blocks, start=1):
+        start_match = HDFC_TXN_START_RE.match(block[0])
+        amount_matches = list(HDFC_MONEY_RE.finditer(block[0]))
+        if not start_match or len(amount_matches) != 2:
+            raise ValueError(
+                f"HDFC statement row {block_number} could not be read safely. "
+                "The transaction line must contain one amount and one closing balance."
+            )
+        date = parse_numeric_date_by_mode(start_match.group(1), "dmy")
+        if not date:
+            raise ValueError(f"HDFC statement row {block_number} has an invalid date: {start_match.group(1)}")
+
+        amount_match, balance_match = amount_matches
+        amount_value = round(abs(float(amount_match.group(1).replace(",", ""))), 2)
+        balance = round(float(balance_match.group(1).replace(",", "")), 2)
+        first_narration = block[0][start_match.end():reference_column].strip()
+        narration_lines = [first_narration] if first_narration else []
+        for continuation in block[1:]:
+            candidate = continuation[:reference_column].strip()
+            if not candidate or footer_or_header.search(candidate) or re.fullmatch(r"[\d\s,./:-]+", candidate):
+                continue
+            narration_lines.append(candidate)
+        narration = re.sub(r"\s+", " ", " ".join(narration_lines)).strip(" -|")[:220]
+        parsed_rows.append({
+            "date": date,
+            "amount": amount_value,
+            "balance": balance,
+            "narration": narration,
+            "first_direction": "Payment" if amount_match.start() <= first_amount_boundary else "Receipt",
+        })
+
+    if not parsed_rows:
+        return None
+
+    bank_ledger_name = bank_ledger_override.strip() or "HDFC Bank"
+    entries: list[Entry] = []
+    receipt_total = 0.0
+    payment_total = 0.0
+    previous_balance = 0.0
+    opening_balance = 0.0
+    for index, row in enumerate(parsed_rows):
+        amount_value = float(row["amount"])
+        balance = float(row["balance"])
+        if index == 0:
+            voucher_type = str(row["first_direction"])
+            opening_balance = round(
+                balance + amount_value if voucher_type == "Payment" else balance - amount_value,
+                2,
+            )
+            previous_balance = opening_balance
+        else:
+            change = round(balance - previous_balance, 2)
+            if abs(change) < 0.01:
+                raise ValueError(f"HDFC statement row {index + 1} has no running-balance movement.")
+            voucher_type = "Receipt" if change > 0 else "Payment"
+            if abs(abs(change) - amount_value) > 0.05:
+                raise ValueError(
+                    f"HDFC statement row {index + 1} on {row['date']} does not reconcile: "
+                    f"transaction amount {amount_value:.2f}, balance movement {abs(change):.2f}."
+                )
+
+        expected_balance = round(
+            previous_balance + amount_value if voucher_type == "Receipt" else previous_balance - amount_value,
+            2,
+        )
+        if abs(expected_balance - balance) > 0.05:
+            raise ValueError(
+                f"HDFC statement row {index + 1} on {row['date']} failed balance validation: "
+                f"expected {expected_balance:.2f}, found {balance:.2f}."
+            )
+
+        if voucher_type == "Receipt":
+            receipt_total = round(receipt_total + amount_value, 2)
+        else:
+            payment_total = round(payment_total + amount_value, 2)
+        narration = str(row["narration"]) or f"Imported from {path.name}"
+        entries.append(Entry(
+            source_file=path.name,
+            source_kind="Bank Statement",
+            voucher_type=voucher_type,
+            date=str(row["date"]),
+            party_ledger=DEFAULT_SUSPENSE_LEDGER,
+            debit_ledger=bank_ledger_name if voucher_type == "Receipt" else DEFAULT_SUSPENSE_LEDGER,
+            credit_ledger=DEFAULT_SUSPENSE_LEDGER if voucher_type == "Receipt" else bank_ledger_name,
+            amount=amount_value,
+            narration=narration,
+            confidence="High",
+            needs_review="No",
+        ))
+        previous_balance = balance
+
+    closing_balance = float(parsed_rows[-1]["balance"])
+    calculated_closing = round(opening_balance + receipt_total - payment_total, 2)
+    if abs(calculated_closing - closing_balance) > 0.05:
+        raise ValueError(
+            "HDFC statement totals do not reconcile: "
+            f"opening {opening_balance:.2f} + receipts {receipt_total:.2f} - payments {payment_total:.2f} "
+            f"= {calculated_closing:.2f}, statement closing is {closing_balance:.2f}."
+        )
+    period_match = re.search(
+        r"From\s*:\s*(\d{1,2}/\d{1,2}/\d{2,4})\s+To\s*:\s*(\d{1,2}/\d{1,2}/\d{2,4})",
+        text,
+        re.I,
+    )
+    if period_match:
+        period_start = parse_numeric_date_by_mode(period_match.group(1), "dmy")
+        period_end = parse_numeric_date_by_mode(period_match.group(2), "dmy")
+    else:
+        period_start, period_end = extract_report_period(text)
+    return entries, {
+        "file": path.name,
+        "kind": "hdfc_bank_statement_layout",
+        "transaction_headers": len(blocks),
+        "transactions": len(entries),
+        "opening_balance": opening_balance,
+        "receipt_total": receipt_total,
+        "payment_total": payment_total,
+        "closing_balance": closing_balance,
+        "calculated_closing_balance": calculated_closing,
+        "reconciliation_difference": round(calculated_closing - closing_balance, 2),
+        "period_start": period_start,
+        "period_end": period_end,
+        "bank_ledger_name": bank_ledger_name,
+        "preview": layout_text[:1000],
+    }
+
+
 def parse_numbered_bank_statement_text(path: Path, text: str, bank_ledger_override: str = "") -> tuple[list[Entry], dict]:
     bank_ledger_name = bank_ledger_override.strip() or current_bank_ledger()
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -1319,6 +1505,9 @@ def parse_icici_bank_statement_text(path: Path, text: str, bank_ledger_override:
 
 
 def parse_bank_statement_text(path: Path, text: str, bank_ledger_override: str = "") -> tuple[list[Entry], dict]:
+    hdfc_statement = parse_hdfc_bank_statement_pdf(path, text, bank_ledger_override)
+    if hdfc_statement is not None:
+        return hdfc_statement
     bob_statement = parse_bob_bank_statement_text(path, text, bank_ledger_override)
     if bob_statement is not None:
         return bob_statement
@@ -1464,6 +1653,17 @@ def extract_text_pdf(path: Path) -> str:
     chunks = []
     for page in reader.pages:
         chunks.append(page.extract_text() or "")
+    return "\n\f\n".join(chunks).strip()
+
+
+def extract_text_pdf_layout(path: Path) -> str:
+    reader = PdfReader(str(path))
+    chunks = []
+    for page in reader.pages:
+        try:
+            chunks.append(page.extract_text(extraction_mode="layout") or "")
+        except TypeError:
+            chunks.append(page.extract_text() or "")
     return "\n\f\n".join(chunks).strip()
 
 
@@ -4083,6 +4283,91 @@ def filter_entries_by_date(entries: list[Entry], date_from: str = "", date_to: s
     return filtered
 
 
+ENTRY_REPLACE_FIELDS = (
+    "voucher_type",
+    "date",
+    "party_ledger",
+    "debit_ledger",
+    "credit_ledger",
+    "narration",
+    "confidence",
+    "needs_review",
+    "voucher_number",
+    "party_gstin",
+)
+
+
+def replace_literal_text(value: str, find_text: str, replacement: str) -> tuple[str, int]:
+    """Replace literal text without treating the replacement as a regex expression."""
+    if not find_text:
+        return value, 0
+    pattern = re.compile(re.escape(find_text), re.IGNORECASE)
+    return pattern.subn(lambda _match: replacement, value)
+
+
+def replace_nested_text(value: object, find_text: str, replacement: str) -> tuple[object, int]:
+    if isinstance(value, str):
+        return replace_literal_text(value, find_text, replacement)
+    if isinstance(value, list):
+        result = []
+        replacements = 0
+        for item in value:
+            updated, count = replace_nested_text(item, find_text, replacement)
+            result.append(updated)
+            replacements += count
+        return result, replacements
+    if isinstance(value, dict):
+        result = {}
+        replacements = 0
+        for key, item in value.items():
+            updated, count = replace_nested_text(item, find_text, replacement)
+            result[key] = updated
+            replacements += count
+        return result, replacements
+    return value, 0
+
+
+def replace_entry_text(entry: Entry, find_text: str, replacement: str) -> int:
+    replacements = 0
+    for field_name in ENTRY_REPLACE_FIELDS:
+        old_value = str(getattr(entry, field_name, "") or "")
+        new_value, count = replace_literal_text(old_value, find_text, replacement)
+        if count:
+            setattr(entry, field_name, new_value)
+            replacements += count
+    inventory_items, inventory_count = replace_nested_text(entry.inventory_items, find_text, replacement)
+    charge_lines, charge_count = replace_nested_text(entry.charge_lines, find_text, replacement)
+    entry.inventory_items = list(inventory_items) if isinstance(inventory_items, list) else []
+    entry.charge_lines = list(charge_lines) if isinstance(charge_lines, list) else []
+    return replacements + inventory_count + charge_count
+
+
+def replace_entries_text(entries: Iterable[Entry], find_text: str, replacement: str) -> tuple[int, int]:
+    if not find_text:
+        raise ValueError("Enter a word or text to find.")
+    replacements = 0
+    affected_entries = 0
+    for entry in entries:
+        entry_count = replace_entry_text(entry, find_text, replacement)
+        replacements += entry_count
+        if entry_count:
+            affected_entries += 1
+    return replacements, affected_entries
+
+
+def render_replace_panel(action: str, scope_text: str) -> str:
+    return f"""
+    <section class="panel">
+      <h2>Find and replace everywhere</h2>
+      <form action="{html.escape(action)}" method="post" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;align-items:end">
+        <label>Find word or text<input name="find_text" required placeholder="Text currently used"></label>
+        <label>Replace with<input name="replace_text" placeholder="New text (leave blank to remove)"></label>
+        <button type="submit" style="width:fit-content">Replace everywhere</button>
+      </form>
+      <p class="note">Replaces matching text in {html.escape(scope_text)}. Matching is literal and ignores letter case.</p>
+    </section>"""
+
+
 def active_entries() -> list[Entry]:
     entries: list[Entry] = []
     for item in ACTIVE_FILES.values():
@@ -4582,6 +4867,10 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
         <form action="/clear" method="post" class="inline-form">
           <button class="danger" type="submit">Clear batch</button>
         </form>"""
+    replace_panel = render_replace_panel(
+        "/replace_entries",
+        "all current entry fields and the regenerated XML",
+    ) if ACTIVE_FILES else ""
     body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -4648,7 +4937,7 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
         <h1>TallyPrime Entry Prep Bot</h1>
         <p>Upload bills and bank statements, review extracted entries, then import the checked file into TallyPrime.</p>
       </div>
-      <nav><a href="/bills">Bills</a><a class="active" href="/">Entries</a><a href="/setup">Company setup</a></nav>
+      <nav><a href="/bills">Bills</a><a class="active" href="/">Entries</a><a href="/xml-updater">XML updater</a><a href="/setup">Company setup</a></nav>
     </header>
     <section class="panel">
       {"<div class='message'>" + html.escape(message) + "</div>" if message else ""}
@@ -4691,6 +4980,7 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
         </table>
       </div>
     </section>
+    {replace_panel}
     <section>
       <form action="/update_entries" method="post">
         {update_button}
@@ -4909,6 +5199,10 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
       <div class="table-actions">
         <button type="submit">Update XML with edited bill entries</button>
       </div>""" if BILL_FILES else ""
+    replace_panel = render_replace_panel(
+        "/replace_bills",
+        "all current bill fields, items, charges, and the regenerated XML",
+    ) if BILL_FILES else ""
     links = ""
     if run_dir:
         links = """
@@ -4990,7 +5284,7 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
         <h1>TallyPrime Bill Parser</h1>
         <p>Upload bills, edit voucher and ledger details, then import the generated XML into TallyPrime.</p>
       </div>
-      <nav><a class="active" href="/bills">Bills</a><a href="/">Entries</a><a href="/setup">Company setup</a></nav>
+      <nav><a class="active" href="/bills">Bills</a><a href="/">Entries</a><a href="/xml-updater">XML updater</a><a href="/setup">Company setup</a></nav>
     </header>
     <section class="panel">
       {"<div class='message'>" + html.escape(message) + "</div>" if message else ""}
@@ -5055,6 +5349,7 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
         </table>
       </div>
     </section>
+    {replace_panel}
     <section>
       <form action="/update_bills" method="post">
         {update_button}
@@ -5249,7 +5544,7 @@ def render_setup_page(message: str = "", run_dir: Path | None = None) -> bytes:
         <h1>TallyPrime Company Setup</h1>
         <p>Create the basic ledger masters file, then import it into the company opened in TallyPrime.</p>
       </div>
-      <nav><a href="/bills">Bills</a><a href="/">Entries</a><a class="active" href="/setup">Company setup</a></nav>
+      <nav><a href="/bills">Bills</a><a href="/">Entries</a><a href="/xml-updater">XML updater</a><a class="active" href="/setup">Company setup</a></nav>
     </header>
     <section class="panel">
       {"<div class='message'>" + html.escape(message) + "</div>" if message else ""}
@@ -5304,9 +5599,476 @@ def parse_multipart(body: bytes, content_type: str) -> tuple[list[tuple[str, byt
     return files, fields
 
 
+def xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def xml_direct_child(parent: ET.Element, name: str) -> ET.Element | None:
+    for child in list(parent):
+        if xml_local_name(child.tag) == name:
+            return child
+    return None
+
+
+def xml_child_tag(parent: ET.Element, name: str) -> str:
+    if parent.tag.startswith("{"):
+        return f"{{{parent.tag[1:].split('}', 1)[0]}}}{name}"
+    return name
+
+
+def xml_child_text(parent: ET.Element, name: str) -> str:
+    child = xml_direct_child(parent, name)
+    return (child.text or "").strip() if child is not None else ""
+
+
+def xml_ensure_child(parent: ET.Element, name: str, after: str = "") -> ET.Element:
+    existing = xml_direct_child(parent, name)
+    if existing is not None:
+        return existing
+    new_child = ET.Element(xml_child_tag(parent, name))
+    children = list(parent)
+    if after:
+        for index, child in enumerate(children):
+            if xml_local_name(child.tag) == after:
+                parent.insert(index + 1, new_child)
+                return new_child
+    parent.append(new_child)
+    return new_child
+
+
+def xml_set_child_text(parent: ET.Element, name: str, value: str, after: str = "") -> None:
+    xml_ensure_child(parent, name, after).text = value
+
+
+def xml_voucher_elements(tree: ET.ElementTree) -> list[ET.Element]:
+    return [node for node in tree.getroot().iter() if xml_local_name(node.tag) == "VOUCHER"]
+
+
+def xml_voucher_ledger_nodes(voucher: ET.Element) -> list[ET.Element]:
+    nodes: list[ET.Element] = []
+    for node in voucher.iter():
+        if xml_local_name(node.tag) not in {"ALLLEDGERENTRIES.LIST", "LEDGERENTRIES.LIST", "ACCOUNTINGALLOCATIONS.LIST"}:
+            continue
+        if xml_direct_child(node, "LEDGERNAME") is not None and xml_direct_child(node, "AMOUNT") is not None:
+            nodes.append(node)
+    return nodes
+
+
+def xml_ledger_amount(node: ET.Element) -> Decimal:
+    try:
+        return xml_signed_decimal(xml_child_text(node, "AMOUNT"))
+    except ValueError:
+        return Decimal("0")
+
+
+def xml_editor_voucher_view(voucher: ET.Element) -> dict[str, object]:
+    ledger_nodes = xml_voucher_ledger_nodes(voucher)
+    amounts = [xml_ledger_amount(node) for node in ledger_nodes]
+    names = [xml_child_text(node, "LEDGERNAME") for node in ledger_nodes]
+    party = xml_child_text(voucher, "PARTYLEDGERNAME")
+    party_index = next((index for index, name in enumerate(names) if party and name == party), None)
+    debit_index = next((index for index, amount in enumerate(amounts) if amount < 0), None)
+    credit_index = next((index for index, amount in enumerate(amounts) if amount > 0), None)
+    if party_index is not None:
+        party_amount = amounts[party_index]
+        opposite = [
+            index for index, amount in enumerate(amounts)
+            if index != party_index and amount * party_amount < 0
+        ]
+        non_tax_opposite = [
+            index for index in opposite
+            if not re.search(r"\b(?:CGST|SGST|IGST|CESS)\b", names[index], re.I)
+        ]
+        counter_index = (non_tax_opposite or opposite or [None])[0]
+        if party_amount < 0:
+            debit_index = party_index
+            if counter_index is not None:
+                credit_index = counter_index
+        elif party_amount > 0:
+            credit_index = party_index
+            if counter_index is not None:
+                debit_index = counter_index
+    visible_amount = Decimal("0")
+    if party_index is not None:
+        visible_amount = abs(amounts[party_index])
+    elif amounts:
+        visible_amount = max(abs(amount) for amount in amounts)
+    return {
+        "ledger_nodes": ledger_nodes,
+        "amounts": amounts,
+        "party_index": party_index,
+        "debit_index": debit_index,
+        "credit_index": credit_index,
+        "debit_ledger": names[debit_index] if debit_index is not None else "",
+        "credit_ledger": names[credit_index] if credit_index is not None else "",
+        "amount": visible_amount,
+    }
+
+
+def xml_signed_decimal(value: str) -> Decimal:
+    text = str(value or "").strip().replace(",", "")
+    negative = text.startswith("(") and text.endswith(")")
+    if negative:
+        text = text[1:-1].strip()
+    text = re.sub(r"[^0-9.+-]", "", text)
+    if not text or text in {"+", "-", ".", "+.", "-."}:
+        raise ValueError("amount is blank or invalid")
+    try:
+        amount = Decimal(text)
+    except InvalidOperation as exc:
+        raise ValueError(f"invalid amount '{value}'") from exc
+    return -abs(amount) if negative else amount
+
+
+def xml_decimal_text(amount: Decimal) -> str:
+    return f"{amount.quantize(Decimal('0.01')):.2f}"
+
+
+def xml_set_ledger_amount(node: ET.Element, amount: Decimal) -> None:
+    old_amount = xml_child_text(node, "AMOUNT")
+    amount_text = xml_decimal_text(amount)
+    xml_set_child_text(node, "AMOUNT", amount_text)
+    for child in list(node):
+        if xml_local_name(child.tag) != "BILLALLOCATIONS.LIST":
+            continue
+        allocation_amount = xml_direct_child(child, "AMOUNT")
+        if allocation_amount is not None and (allocation_amount.text or "").strip() == old_amount:
+            allocation_amount.text = amount_text
+    deemed = xml_direct_child(node, "ISDEEMEDPOSITIVE")
+    if deemed is not None:
+        deemed.text = "Yes" if amount < 0 else "No"
+    last_deemed = xml_direct_child(node, "ISLASTDEEMEDPOSITIVE")
+    if last_deemed is not None:
+        last_deemed.text = "Yes" if amount < 0 else "No"
+
+
+def xml_editor_rows(tree: ET.ElementTree) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for index, voucher in enumerate(xml_voucher_elements(tree)):
+        voucher_view = xml_editor_voucher_view(voucher)
+        voucher_type = xml_child_text(voucher, "VOUCHERTYPENAME") or voucher.attrib.get("VCHTYPE", "")
+        rows.append({
+            "index": index,
+            "voucher_number": xml_child_text(voucher, "VOUCHERNUMBER"),
+            "voucher_type": voucher_type,
+            "date": xml_child_text(voucher, "DATE"),
+            "party_ledger": xml_child_text(voucher, "PARTYLEDGERNAME"),
+            "debit_ledger": voucher_view["debit_ledger"],
+            "credit_ledger": voucher_view["credit_ledger"],
+            "amount": voucher_view["amount"],
+            "narration": xml_child_text(voucher, "NARRATION"),
+        })
+    return rows
+
+
+def write_xml_editor_output() -> Path:
+    tree = XML_EDITOR_STATE.get("tree")
+    if not isinstance(tree, ET.ElementTree):
+        raise ValueError("Upload a Tally voucher XML first.")
+    original_name = str(XML_EDITOR_STATE.get("filename", "tally_vouchers.xml"))
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(original_name).stem).strip("._") or "tally_vouchers"
+    output_path = TMP_DIR / f"updated_{stem}.xml"
+    ET.indent(tree, space="  ")
+    tree.write(output_path, encoding="utf-8", xml_declaration=True, short_empty_elements=False)
+    XML_EDITOR_STATE["output_path"] = output_path
+    return output_path
+
+
+def load_xml_editor_file(filename: str, data: bytes) -> int:
+    if Path(filename).suffix.lower() != ".xml":
+        raise ValueError("Select an XML file generated for TallyPrime.")
+    if not data.strip():
+        raise ValueError("The selected XML file is empty.")
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as exc:
+        raise ValueError(f"The selected file is not valid XML: {exc}") from exc
+    tree = ET.ElementTree(root)
+    vouchers = xml_voucher_elements(tree)
+    if not vouchers:
+        raise ValueError("No VOUCHER records were found. Upload the voucher XML or a combined Tally XML, not a masters-only XML.")
+    XML_EDITOR_STATE.clear()
+    XML_EDITOR_STATE.update({"filename": Path(filename).name, "tree": tree, "revision": 0})
+    write_xml_editor_output()
+    return len(vouchers)
+
+
+def replace_xml_editor_text(find_text: str, replacement: str) -> int:
+    if not find_text:
+        raise ValueError("Enter a word or text to find.")
+    current_tree = XML_EDITOR_STATE.get("tree")
+    if not isinstance(current_tree, ET.ElementTree):
+        raise ValueError("Upload a Tally voucher XML first.")
+    tree = copy.deepcopy(current_tree)
+    messages = [node for node in tree.getroot().iter() if xml_local_name(node.tag) == "TALLYMESSAGE"]
+    if not messages:
+        raise ValueError("No TALLYMESSAGE data records were found in this XML.")
+    replacements = 0
+    for message in messages:
+        for node in message.iter():
+            if node.text:
+                node.text, count = replace_literal_text(node.text, find_text, replacement)
+                replacements += count
+            for attribute, value in list(node.attrib.items()):
+                updated, count = replace_literal_text(value, find_text, replacement)
+                if count:
+                    node.attrib[attribute] = updated
+                    replacements += count
+    if replacements:
+        XML_EDITOR_STATE["tree"] = tree
+        XML_EDITOR_STATE["revision"] = int(XML_EDITOR_STATE.get("revision", 0)) + 1
+        write_xml_editor_output()
+    return replacements
+
+
+def update_xml_editor_from_form(form: dict[str, list[str]]) -> int:
+    current_tree = XML_EDITOR_STATE.get("tree")
+    if not isinstance(current_tree, ET.ElementTree):
+        raise ValueError("Upload a Tally voucher XML first.")
+    tree = copy.deepcopy(current_tree)
+    vouchers = xml_voucher_elements(tree)
+    updated = 0
+    for index, voucher in enumerate(vouchers):
+        prefix = f"xml:{index}:"
+        if not any(key.startswith(prefix) for key in form):
+            continue
+        old_number = xml_child_text(voucher, "VOUCHERNUMBER")
+        old_date = xml_child_text(voucher, "DATE")
+        old_party = xml_child_text(voucher, "PARTYLEDGERNAME")
+        old_voucher_type = xml_child_text(voucher, "VOUCHERTYPENAME") or voucher.attrib.get("VCHTYPE", "")
+        old_narration = xml_child_text(voucher, "NARRATION")
+        voucher_number = form.get(prefix + "voucher_number", [old_number])[0].strip()
+        voucher_type = form.get(prefix + "voucher_type", [old_voucher_type])[0].strip()
+        date_input = form.get(prefix + "date", [display_date(old_date)])[0].strip()
+        party = form.get(prefix + "party_ledger", [old_party])[0].strip()
+        narration = form.get(prefix + "narration", [old_narration])[0].strip()
+        voucher_view = xml_editor_voucher_view(voucher)
+        old_debit_ledger = str(voucher_view["debit_ledger"])
+        old_credit_ledger = str(voucher_view["credit_ledger"])
+        old_amount = Decimal(voucher_view["amount"])
+        debit_ledger = form.get(prefix + "debit_ledger", [old_debit_ledger])[0].strip()
+        credit_ledger = form.get(prefix + "credit_ledger", [old_credit_ledger])[0].strip()
+        amount_text = form.get(prefix + "amount", [xml_decimal_text(old_amount)])[0].strip()
+
+        normalized_date = normalize_date(date_input)
+        if not normalized_date:
+            raise ValueError(f"Row {index + 1}: date '{date_input}' is invalid.")
+        if not voucher_type:
+            raise ValueError(f"Row {index + 1}: voucher type cannot be blank.")
+        if not party:
+            raise ValueError(f"Row {index + 1}: party ledger cannot be blank.")
+        if not debit_ledger or not credit_ledger:
+            raise ValueError(f"Row {index + 1}: debit and credit ledgers cannot be blank.")
+        amount = abs(xml_signed_decimal(amount_text))
+        if amount <= 0:
+            raise ValueError(f"Row {index + 1}: amount must be greater than zero.")
+
+        number_changed = voucher_number != old_number
+        type_changed = voucher_type != old_voucher_type
+        date_changed = normalized_date != old_date
+        party_changed = party != old_party
+        narration_changed = narration != old_narration
+        debit_changed = debit_ledger != old_debit_ledger
+        credit_changed = credit_ledger != old_credit_ledger
+        amount_changed = amount != old_amount
+        if not any((number_changed, type_changed, date_changed, party_changed, narration_changed, debit_changed, credit_changed, amount_changed)):
+            continue
+
+        if number_changed:
+            xml_set_child_text(voucher, "VOUCHERNUMBER", voucher_number, "VOUCHERTYPENAME")
+        if type_changed:
+            xml_set_child_text(voucher, "VOUCHERTYPENAME", voucher_type, "EFFECTIVEDATE")
+            voucher.attrib["VCHTYPE"] = voucher_type
+        if date_changed:
+            xml_set_child_text(voucher, "DATE", normalized_date)
+        if party_changed:
+            xml_set_child_text(voucher, "PARTYLEDGERNAME", party, "REFERENCEDATE")
+        if narration_changed:
+            xml_set_child_text(voucher, "NARRATION", narration, "ISINVOICE")
+
+        ledger_nodes = list(voucher_view["ledger_nodes"])
+        debit_index = voucher_view["debit_index"]
+        credit_index = voucher_view["credit_index"]
+        party_index = voucher_view["party_index"]
+        if debit_index is None or credit_index is None:
+            raise ValueError(f"Row {index + 1}: Tally debit/credit allocations could not be identified.")
+
+        if debit_changed:
+            xml_set_child_text(ledger_nodes[int(debit_index)], "LEDGERNAME", debit_ledger)
+        if credit_changed:
+            xml_set_child_text(ledger_nodes[int(credit_index)], "LEDGERNAME", credit_ledger)
+        if party_changed and party_index is not None:
+            xml_set_child_text(ledger_nodes[int(party_index)], "LEDGERNAME", party)
+
+        if amount_changed:
+            amounts = list(voucher_view["amounts"])
+            if party_index is not None:
+                party_index = int(party_index)
+                party_sign = Decimal("-1") if amounts[party_index] < 0 else Decimal("1")
+                amounts[party_index] = party_sign * amount
+                counter_index = int(credit_index) if party_sign < 0 else int(debit_index)
+                other_total = sum(
+                    (value for position, value in enumerate(amounts) if position not in {party_index, counter_index}),
+                    Decimal("0"),
+                )
+                amounts[counter_index] = -(amounts[party_index] + other_total)
+            else:
+                amounts[int(debit_index)] = -amount
+                amounts[int(credit_index)] = amount
+            for node, ledger_amount in zip(ledger_nodes, amounts):
+                xml_set_ledger_amount(node, ledger_amount)
+
+        for node in voucher.iter():
+            local_name = xml_local_name(node.tag)
+            text = (node.text or "").strip()
+            if old_number and number_changed and local_name in {"REFERENCE", "NAME"} and text == old_number:
+                node.text = voucher_number
+            if old_date and date_changed and local_name in {"EFFECTIVEDATE", "REFERENCEDATE"} and text == old_date:
+                node.text = normalized_date
+            if old_party and party_changed and local_name in {"BASICBASEPARTYNAME", "BASICBUYERNAME", "PARTYNAME"} and text == old_party:
+                node.text = party
+        updated += 1
+
+    XML_EDITOR_STATE["tree"] = tree
+    XML_EDITOR_STATE["revision"] = int(XML_EDITOR_STATE.get("revision", 0)) + 1
+    write_xml_editor_output()
+    return updated
+
+
+def render_xml_editor_page(message: str = "", is_error: bool = False) -> bytes:
+    tree = XML_EDITOR_STATE.get("tree")
+    rows = xml_editor_rows(tree) if isinstance(tree, ET.ElementTree) else []
+    filename = str(XML_EDITOR_STATE.get("filename", ""))
+    revision = int(XML_EDITOR_STATE.get("revision", 0))
+    rows_html = ""
+    for row in rows:
+        index = int(row["index"])
+        prefix = f"xml:{index}"
+        search_text = " ".join(str(row[key]) for key in ("voucher_number", "voucher_type", "date", "party_ledger", "debit_ledger", "credit_ledger", "amount", "narration"))
+        rows_html += f"""
+        <tr class="xml-row" data-search="{html.escape(search_text.lower())}">
+          <td><input type="checkbox" class="xml-row-check" aria-label="Select voucher"></td>
+          <td>{html.escape(filename)}</td>
+          <td><input name="{prefix}:voucher_number" value="{html.escape(str(row['voucher_number']))}"></td>
+          <td><input name="{prefix}:voucher_type" value="{html.escape(str(row['voucher_type']))}"></td>
+          <td><input type="date" name="{prefix}:date" value="{html.escape(display_date(str(row['date'])))}"></td>
+          <td><input class="party-input" name="{prefix}:party_ledger" value="{html.escape(str(row['party_ledger']))}"></td>
+          <td><input class="ledger-input" name="{prefix}:debit_ledger" value="{html.escape(str(row['debit_ledger']))}"></td>
+          <td><input class="ledger-input" name="{prefix}:credit_ledger" value="{html.escape(str(row['credit_ledger']))}"></td>
+          <td><input class="amount-input" name="{prefix}:amount" value="{xml_decimal_text(Decimal(row['amount']))}"></td>
+          <td><input class="narration-input" name="{prefix}:narration" value="{html.escape(str(row['narration']))}"></td>
+        </tr>"""
+    status = ""
+    if filename:
+        status = f"<strong>{html.escape(filename)}</strong><span>{len(rows)} vouchers</span><span>Revision {revision}</span>"
+    message_class = "message error" if is_error else "message"
+    message_html = f"<div class='{message_class}'>{html.escape(message)}</div>" if message else ""
+    editor_html = ""
+    if rows:
+        editor_html = f"""
+        <section class="panel status-line">{status}<a class="download" href="/xml-updater/download">Download updated XML</a></section>
+        {render_replace_panel('/xml_replace', 'all master and voucher values in the currently opened XML')}
+        <form action="/xml_update" method="post" id="xmlEditForm">
+          <section class="panel controls">
+            <label>Search vouchers<input id="xmlSearch" placeholder="Voucher no., party, ledger, narration, amount"></label>
+            <span id="xmlSearchCount">{len(rows)} vouchers shown</span>
+          </section>
+          <section class="panel controls">
+            <label>Bulk column
+              <select id="xmlBulkColumn">
+                <option value="party_ledger">Party ledger</option>
+                <option value="debit_ledger">Debit ledger</option>
+                <option value="credit_ledger">Credit ledger</option>
+                <option value="amount">Amount</option>
+                <option value="voucher_type">Voucher type</option>
+                <option value="date">Date</option>
+                <option value="narration">Narration</option>
+              </select>
+            </label>
+            <label>New value<input id="xmlBulkValue" placeholder="Value for selected vouchers"></label>
+            <button type="button" id="xmlBulkApply">Apply to selected</button>
+            <span id="xmlSelectedCount">0 selected</span>
+          </section>
+          <div class="top-scroll" id="xmlTopScroll"><div></div></div>
+          <div class="table-wrap" id="xmlTableWrap">
+            <table>
+              <thead><tr><th><input type="checkbox" id="xmlSelectAll" title="Select all visible vouchers"></th><th>Source</th><th>Voucher no.</th><th>Voucher</th><th>Date</th><th>Party ledger</th><th>Debit ledger</th><th>Credit ledger</th><th>Amount</th><th>Narration</th></tr></thead>
+              <tbody>{rows_html}</tbody>
+            </table>
+          </div>
+          <section class="panel save-bar"><span>Only the fields you change are updated. Other XML details remain untouched.</span><button type="submit">Update this XML</button></section>
+        </form>"""
+    body = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TallyPrime XML Updater</title>
+<style>
+:root {{ font-family: "Segoe UI", Arial, sans-serif; color: #1f2937; }} * {{ box-sizing: border-box; }}
+body {{ margin: 0; background: #f4f6f8; }} main {{ max-width: 1500px; margin: 0 auto; padding: 30px 24px 44px; }}
+header {{ display:flex; justify-content:space-between; gap:18px; align-items:flex-start; margin-bottom:22px; }} h1 {{ margin:0 0 6px; font-size:32px; }} h2 {{ margin:0 0 12px; font-size:18px; }} p {{ margin:0; color:#5f6368; line-height:1.5; }} .note {{ margin-top:10px; font-size:13px; }}
+nav {{ display:flex; gap:8px; flex-wrap:wrap; }} nav a {{ color:#174ea6; background:#e8f0fe; text-decoration:none; padding:10px 14px; border-radius:999px; font-weight:700; }} nav a.active {{ background:#174ea6; color:white; }}
+.panel {{ background:white; border:1px solid #d9e0e7; border-radius:12px; padding:18px; margin-bottom:16px; box-shadow:0 8px 22px rgba(15,23,42,.05); }}
+.upload-form {{ display:flex; gap:14px; align-items:end; flex-wrap:wrap; }} label {{ display:grid; gap:6px; font-weight:700; }} input, select, textarea {{ border:1px solid #c9d2de; border-radius:8px; padding:10px 11px; font:inherit; background:white; }} input:focus, select:focus, textarea:focus {{ outline:2px solid #d2e3fc; border-color:#174ea6; }} input[type=file] {{ min-width:420px; border-style:dashed; background:#fafcff; }}
+button, .download {{ border:0; border-radius:8px; background:#1967d2; color:white; padding:11px 17px; font-weight:700; cursor:pointer; text-decoration:none; }} button:hover, .download:hover {{ background:#1557b0; }} .danger {{ background:#c5221f; }}
+.message {{ background:#e6f4ea; border:1px solid #b7dfc3; color:#0b6b35; padding:12px 14px; border-radius:10px; margin-bottom:16px; font-weight:700; }} .message.error {{ background:#fce8e6; border-color:#f2b8b5; color:#a50e0e; }}
+.status-line, .controls, .save-bar {{ display:flex; gap:14px; align-items:end; flex-wrap:wrap; }} .status-line span {{ color:#5f6368; }} .status-line .download {{ margin-left:auto; }} .controls label {{ min-width:250px; }} .controls > span {{ color:#5f6368; padding-bottom:10px; }}
+.top-scroll {{ overflow-x:auto; overflow-y:hidden; height:18px; border:1px solid #d9e0e7; border-bottom:0; background:white; }} .top-scroll div {{ height:1px; width:2200px; }}
+.table-wrap {{ overflow:auto; max-height:68vh; border:1px solid #d9e0e7; background:white; }} table {{ width:100%; min-width:2200px; border-collapse:collapse; }} th, td {{ padding:10px; border-bottom:1px solid #e8edf3; text-align:left; vertical-align:top; }} th {{ position:sticky; top:0; background:#f7f9fc; color:#5f6368; text-transform:uppercase; font-size:12px; z-index:2; }} td input {{ width:170px; }} td input[type=checkbox], th input[type=checkbox] {{ width:auto; }} .party-input, .ledger-input {{ width:230px; }} .amount-input {{ width:140px; text-align:right; font-variant-numeric:tabular-nums; }} .narration-input {{ width:360px; }} .save-bar {{ justify-content:space-between; margin-top:16px; }}
+@media (max-width:800px) {{ main {{ padding:20px 12px; }} header {{ display:block; }} nav {{ margin-top:14px; }} input[type=file] {{ min-width:280px; max-width:100%; }} }}
+</style></head><body><main>
+<header><div><h1>XML Updater</h1><p>Open an existing voucher XML, make further corrections, and download a new version without processing the source bills again.</p></div>
+<nav><a href="/bills">Bills</a><a href="/">Entries</a><a class="active" href="/xml-updater">XML updater</a><a href="/setup">Company setup</a></nav></header>
+{message_html}
+<section class="panel"><form class="upload-form" action="/xml_upload" method="post" enctype="multipart/form-data"><label>Existing Tally XML<input type="file" name="files" accept=".xml" required></label><button type="submit">Open XML</button></form><p style="margin-top:12px">Use <strong>2. Import Vouchers XML</strong> or a combined Tally XML. Masters and all unedited Tally fields are preserved.</p></section>
+{editor_html}
+</main>
+<script>
+const rows = () => Array.from(document.querySelectorAll('.xml-row'));
+const checks = () => Array.from(document.querySelectorAll('.xml-row-check'));
+const search = document.getElementById('xmlSearch'); const selectAll = document.getElementById('xmlSelectAll');
+function visibleRows() {{ return rows().filter(row => row.style.display !== 'none'); }}
+function refreshCounts() {{
+  const visible = visibleRows(); const selected = visible.filter(row => row.querySelector('.xml-row-check').checked);
+  const searchCount = document.getElementById('xmlSearchCount'); const selectedCount = document.getElementById('xmlSelectedCount');
+  if (searchCount) searchCount.textContent = `${{visible.length}} vouchers shown`;
+  if (selectedCount) selectedCount.textContent = `${{selected.length}} selected`;
+  if (selectAll) {{ selectAll.checked = visible.length > 0 && selected.length === visible.length; selectAll.indeterminate = selected.length > 0 && selected.length < visible.length; }}
+}}
+function filterRows() {{
+  const query = (search?.value || '').trim().toLowerCase();
+  rows().forEach(row => {{ const current = Array.from(row.querySelectorAll('input,textarea')).map(el => el.value).join(' ').toLowerCase(); row.style.display = (!query || (row.dataset.search + ' ' + current).includes(query)) ? '' : 'none'; }});
+  refreshCounts();
+}}
+if (search) search.addEventListener('input', filterRows);
+if (selectAll) selectAll.addEventListener('change', () => {{ visibleRows().forEach(row => row.querySelector('.xml-row-check').checked = selectAll.checked); refreshCounts(); }});
+checks().forEach(check => check.addEventListener('change', refreshCounts));
+const bulkApply = document.getElementById('xmlBulkApply');
+if (bulkApply) bulkApply.addEventListener('click', () => {{
+  const column = document.getElementById('xmlBulkColumn').value; const value = document.getElementById('xmlBulkValue').value;
+  visibleRows().filter(row => row.querySelector('.xml-row-check').checked).forEach(row => {{ const field = row.querySelector(`[name$=":${{column}}"]`); if (field) {{ field.value = value; field.dispatchEvent(new Event('input', {{bubbles:true}})); }} }}); filterRows();
+}});
+const topScroll = document.getElementById('xmlTopScroll'); const tableWrap = document.getElementById('xmlTableWrap'); let syncing = false;
+if (topScroll && tableWrap) {{ topScroll.firstElementChild.style.width = `${{tableWrap.scrollWidth}}px`; topScroll.addEventListener('scroll', () => {{ if (!syncing) {{ syncing=true; tableWrap.scrollLeft=topScroll.scrollLeft; syncing=false; }} }}); tableWrap.addEventListener('scroll', () => {{ if (!syncing) {{ syncing=true; topScroll.scrollLeft=tableWrap.scrollLeft; syncing=false; }} }}); }}
+refreshCounts();
+</script></body></html>"""
+    return body.encode("utf-8")
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/xml-updater/download":
+            target = XML_EDITOR_STATE.get("output_path")
+            if not isinstance(target, Path) or not target.is_file():
+                self.send_error(404, "No updated XML is available")
+                return
+            original_name = str(XML_EDITOR_STATE.get("filename", "tally_vouchers.xml"))
+            download_name = f"updated_{Path(original_name).stem}.xml"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/xml; charset=utf-8")
+            self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
+            self.end_headers()
+            self.wfile.write(target.read_bytes())
+            return
         if parsed.path.startswith("/latest_export/"):
             target = (LATEST_EXPORT_DIR / parsed.path.removeprefix("/latest_export/")).resolve()
             if not str(target).startswith(str(LATEST_EXPORT_DIR.resolve())) or not target.is_file():
@@ -5348,6 +6110,12 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(render_setup_page())
             return
+        if parsed.path == "/xml-updater":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(render_xml_editor_page())
+            return
         if parsed.path == "/bills":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -5373,6 +6141,58 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(render_page())
 
     def do_POST(self) -> None:
+        global BILL_LAST_RUN_DIR, LAST_RUN_DIR
+        if self.path == "/xml_upload":
+            length = int(self.headers.get("Content-Length", "0"))
+            files, _ = parse_multipart(self.rfile.read(length), self.headers.get("Content-Type", ""))
+            try:
+                if not files:
+                    raise ValueError("Select an existing Tally XML file.")
+                filename, data = files[0]
+                count = load_xml_editor_file(filename, data)
+                message = f"Opened {filename} with {count} voucher{'s' if count != 1 else ''}. You can update it repeatedly."
+                page = render_xml_editor_page(message)
+            except Exception as exc:
+                page = render_xml_editor_page(str(exc), is_error=True)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(page)
+            return
+        if self.path == "/xml_update":
+            length = int(self.headers.get("Content-Length", "0"))
+            form = parse_qs(self.rfile.read(length).decode("utf-8", errors="ignore"), keep_blank_values=True)
+            try:
+                count = update_xml_editor_from_form(form)
+                revision = int(XML_EDITOR_STATE.get("revision", 0))
+                page = render_xml_editor_page(
+                    f"Updated {count} voucher{'s' if count != 1 else ''}. Revision {revision} is ready to download; you can continue editing it here."
+                )
+            except Exception as exc:
+                page = render_xml_editor_page(str(exc), is_error=True)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(page)
+            return
+        if self.path == "/xml_replace":
+            length = int(self.headers.get("Content-Length", "0"))
+            form = parse_qs(self.rfile.read(length).decode("utf-8", errors="ignore"), keep_blank_values=True)
+            try:
+                find_text = form.get("find_text", [""])[0]
+                replacement = form.get("replace_text", [""])[0]
+                count = replace_xml_editor_text(find_text, replacement)
+                revision = int(XML_EDITOR_STATE.get("revision", 0))
+                page = render_xml_editor_page(
+                    f"Replaced {count} occurrence{'s' if count != 1 else ''} across the XML. Revision {revision} is ready to download."
+                )
+            except Exception as exc:
+                page = render_xml_editor_page(str(exc), is_error=True)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(page)
+            return
         if self.path == "/setup":
             length = int(self.headers.get("Content-Length", "0"))
             form = parse_qs(self.rfile.read(length).decode("utf-8", errors="ignore"))
@@ -5422,6 +6242,26 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(render_bill_page("Cleared bill batch. Upload fresh bills now."))
             return
+        if self.path == "/replace_bills":
+            length = int(self.headers.get("Content-Length", "0"))
+            form = parse_qs(self.rfile.read(length).decode("utf-8", errors="ignore"), keep_blank_values=True)
+            find_text = form.get("find_text", [""])[0]
+            replacement = form.get("replace_text", [""])[0]
+            try:
+                replacements, affected = replace_entries_text(active_bill_entries(), find_text, replacement)
+                run_dir = rebuild_bill_outputs()
+                message = (
+                    f"Replaced {replacements} occurrence{'s' if replacements != 1 else ''} "
+                    f"in {affected} bill entr{'y' if affected == 1 else 'ies'} and regenerated the XML."
+                )
+            except Exception as exc:
+                run_dir = BILL_LAST_RUN_DIR
+                message = str(exc)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(render_bill_page(message, run_dir))
+            return
         if self.path == "/update_bills":
             length = int(self.headers.get("Content-Length", "0"))
             form = parse_qs(
@@ -5450,7 +6290,6 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/bill_upload":
             length = int(self.headers.get("Content-Length", "0"))
             files, fields = parse_multipart(self.rfile.read(length), self.headers.get("Content-Type", ""))
-            global BILL_LAST_RUN_DIR
             set_date_parse_mode(fields.get("date_format", "auto"))
             entry_type = fields.get("entry_type", "purchase").strip() or "purchase"
             bill_source = fields.get("bill_source", "generated").strip() or "generated"
@@ -5496,6 +6335,26 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(render_page(message, run_dir))
             return
+        if self.path == "/replace_entries":
+            length = int(self.headers.get("Content-Length", "0"))
+            form = parse_qs(self.rfile.read(length).decode("utf-8", errors="ignore"), keep_blank_values=True)
+            find_text = form.get("find_text", [""])[0]
+            replacement = form.get("replace_text", [""])[0]
+            try:
+                replacements, affected = replace_entries_text(active_entries(), find_text, replacement)
+                run_dir = rebuild_active_outputs()
+                message = (
+                    f"Replaced {replacements} occurrence{'s' if replacements != 1 else ''} "
+                    f"in {affected} entr{'y' if affected == 1 else 'ies'} and regenerated the XML."
+                )
+            except Exception as exc:
+                run_dir = LAST_RUN_DIR
+                message = str(exc)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(render_page(message, run_dir))
+            return
         if self.path != "/upload":
             self.send_error(404)
             return
@@ -5503,7 +6362,6 @@ class Handler(BaseHTTPRequestHandler):
         files, fields = parse_multipart(self.rfile.read(length), self.headers.get("Content-Type", ""))
         if fields.get("append_batch") != "yes":
             ACTIVE_FILES.clear()
-            global LAST_RUN_DIR
             LAST_RUN_DIR = None
         set_date_parse_mode(fields.get("date_format", "auto"))
         bank_ledger_override = fields.get("bank_ledger", "").strip()
