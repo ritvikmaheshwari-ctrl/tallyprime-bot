@@ -921,12 +921,57 @@ def parse_bob_bank_statement_text(path: Path, text: str, bank_ledger_override: s
         return -value if suffix.strip().lower() == "dr" else value
 
     def clean_bob_narration(segment: str, token_positions: list[tuple[int, int]]) -> str:
-        body = date_re.sub(" ", segment, count=1)
         if token_positions:
-            body = body[: token_positions[-2][0] if len(token_positions) >= 2 else token_positions[-1][0]]
+            # The amount offsets belong to the original segment.  Cut the
+            # amount columns before removing the date so the offsets stay
+            # aligned and amount/balance fragments do not leak into narration.
+            cutoff = token_positions[-2][0] if len(token_positions) >= 2 else token_positions[-1][0]
+            body = segment[:cutoff]
+        else:
+            body = segment
+        body = date_re.sub(" ", body, count=1)
         body = re.sub(r"\b(?:Page\s+\d+\s+of\s+\d+|Transaction\s+Details|BANK\s+OF\s+BARODA|Statement\s+of\s+account).*$", "", body, flags=re.I)
         body = re.sub(r"\s+", " ", body).strip(" -|:")
-        return body[:220]
+        return body[:500]
+
+    def clean_bob_continuation(segment: str) -> str:
+        body = re.sub(r"\s+", " ", segment.replace("\u00a0", " ")).strip()
+        if not body or re.fullmatch(r"[-_=\s]+", body):
+            return ""
+        if re.search(
+            r"(?:\b(?:Page Total|Statement of account|A/C Number|Account Open Date|"
+            r"Transaction Details|BANK OF BARODA|DATE\s+PARTICULARS|"
+            r"Unless the constituent|HELPLINE|BRANCH PHONE|MICR CODE|IFSC CODE)\b|Note\s*:)",
+            body,
+            re.I,
+        ):
+            return ""
+        if re.search(r"https?://|tran_rpt\.jsp", body, re.I):
+            return ""
+        return body.strip(" -|:")[:500]
+
+    def append_bob_continuation(segment: str) -> None:
+        if not entries:
+            return
+        continuation = clean_bob_continuation(segment)
+        if not continuation:
+            return
+        existing = entries[-1].narration.strip()
+        if continuation.lower() in existing.lower():
+            return
+        existing_method = re.match(r"([A-Z]+)[/-]", existing, re.I)
+        continuation_method = re.match(r"([A-Z]+)[/-]", continuation, re.I)
+        if (
+            existing_method
+            and continuation_method
+            and existing_method.group(1).upper() == continuation_method.group(1).upper()
+        ):
+            # BOB prints a short reference on the dated row and the complete
+            # transaction detail on the following row.  Keep the complete row
+            # instead of duplicating the abbreviated reference.
+            entries[-1].narration = continuation[:500]
+            return
+        entries[-1].narration = f"{existing} | {continuation}".strip(" |")[0:500]
 
     def split_bob_line(line: str) -> list[str]:
         line = re.sub(r"\s+", " ", line.replace("\u00a0", " ")).strip()
@@ -945,10 +990,24 @@ def parse_bob_bank_statement_text(path: Path, text: str, bank_ledger_override: s
         return parts
 
     for raw_line in text.splitlines():
+        # On a PDF page break, Bank of Baroda may place the previous
+        # transaction's second narration row after "Page No" on the same
+        # extracted line as the next page header.  Preserve that suffix before
+        # ignoring the header itself.
+        page_continuation = re.search(
+            r"Page\s+No\s*:\s*\d+\s+((?:UPI|NEFT|RTGS|IMPS|NACH|ECS|ACH|ATM|POS|ECOM|TRANSFER|TRF|CASH|CHEQUE|CHQ)[/-].*)$",
+            re.sub(r"\s+", " ", raw_line.replace("\u00a0", " ")).strip(),
+            re.I,
+        )
+        if page_continuation:
+            append_bob_continuation(page_continuation.group(1))
         for segment in split_bob_line(raw_line):
             if re.search(r"\b(Page Total|Statement of account|A/C Number|Account Open Date|Note:|Transaction Details|BANK OF BARODA)\b", segment, re.I):
                 continue
             date_match = date_re.search(segment)
+            if not date_match:
+                append_bob_continuation(segment)
+                continue
             if date_match:
                 parsed_date = normalize_numeric_date_text(date_match.group(1))
                 if parsed_date:
