@@ -4342,91 +4342,6 @@ def filter_entries_by_date(entries: list[Entry], date_from: str = "", date_to: s
     return filtered
 
 
-ENTRY_REPLACE_FIELDS = (
-    "voucher_type",
-    "date",
-    "party_ledger",
-    "debit_ledger",
-    "credit_ledger",
-    "narration",
-    "confidence",
-    "needs_review",
-    "voucher_number",
-    "party_gstin",
-)
-
-
-def replace_literal_text(value: str, find_text: str, replacement: str) -> tuple[str, int]:
-    """Replace literal text without treating the replacement as a regex expression."""
-    if not find_text:
-        return value, 0
-    pattern = re.compile(re.escape(find_text), re.IGNORECASE)
-    return pattern.subn(lambda _match: replacement, value)
-
-
-def replace_nested_text(value: object, find_text: str, replacement: str) -> tuple[object, int]:
-    if isinstance(value, str):
-        return replace_literal_text(value, find_text, replacement)
-    if isinstance(value, list):
-        result = []
-        replacements = 0
-        for item in value:
-            updated, count = replace_nested_text(item, find_text, replacement)
-            result.append(updated)
-            replacements += count
-        return result, replacements
-    if isinstance(value, dict):
-        result = {}
-        replacements = 0
-        for key, item in value.items():
-            updated, count = replace_nested_text(item, find_text, replacement)
-            result[key] = updated
-            replacements += count
-        return result, replacements
-    return value, 0
-
-
-def replace_entry_text(entry: Entry, find_text: str, replacement: str) -> int:
-    replacements = 0
-    for field_name in ENTRY_REPLACE_FIELDS:
-        old_value = str(getattr(entry, field_name, "") or "")
-        new_value, count = replace_literal_text(old_value, find_text, replacement)
-        if count:
-            setattr(entry, field_name, new_value)
-            replacements += count
-    inventory_items, inventory_count = replace_nested_text(entry.inventory_items, find_text, replacement)
-    charge_lines, charge_count = replace_nested_text(entry.charge_lines, find_text, replacement)
-    entry.inventory_items = list(inventory_items) if isinstance(inventory_items, list) else []
-    entry.charge_lines = list(charge_lines) if isinstance(charge_lines, list) else []
-    return replacements + inventory_count + charge_count
-
-
-def replace_entries_text(entries: Iterable[Entry], find_text: str, replacement: str) -> tuple[int, int]:
-    if not find_text:
-        raise ValueError("Enter a word or text to find.")
-    replacements = 0
-    affected_entries = 0
-    for entry in entries:
-        entry_count = replace_entry_text(entry, find_text, replacement)
-        replacements += entry_count
-        if entry_count:
-            affected_entries += 1
-    return replacements, affected_entries
-
-
-def render_replace_panel(action: str, scope_text: str) -> str:
-    return f"""
-    <section class="panel">
-      <h2>Find and replace everywhere</h2>
-      <form action="{html.escape(action)}" method="post" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;align-items:end">
-        <label>Find word or text<input name="find_text" required placeholder="Text currently used"></label>
-        <label>Replace with<input name="replace_text" placeholder="New text (leave blank to remove)"></label>
-        <button type="submit" style="width:fit-content">Replace everywhere</button>
-      </form>
-      <p class="note">Replaces matching text in {html.escape(scope_text)}. Matching is literal and ignores letter case.</p>
-    </section>"""
-
-
 def active_entries() -> list[Entry]:
     entries: list[Entry] = []
     for item in ACTIVE_FILES.values():
@@ -4926,10 +4841,6 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
         <form action="/clear" method="post" class="inline-form">
           <button class="danger" type="submit">Clear batch</button>
         </form>"""
-    replace_panel = render_replace_panel(
-        "/replace_entries",
-        "all current entry fields and the regenerated XML",
-    ) if ACTIVE_FILES else ""
     body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -5039,7 +4950,6 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
         </table>
       </div>
     </section>
-    {replace_panel}
     <section>
       <form action="/update_entries" method="post">
         {update_button}
@@ -5068,6 +4978,16 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
           </label>
           <button type="button" id="entryApplyBulk">Apply to selected</button>
           <div id="entrySelectedCount" class="bulk-count">0 rows selected</div>
+        </div>
+        <div class="bulk-actions">
+          <label>Find in selected column
+            <input id="entryReplaceFind" placeholder="Word or text to change">
+          </label>
+          <label>Replace with
+            <input id="entryReplaceValue" placeholder="New word or text">
+          </label>
+          <button type="button" id="entryApplyReplace">Replace in selected rows</button>
+          <div id="entryReplaceStatus" class="bulk-count">Choose a column above and check the required rows</div>
         </div>
         <div class="review-scroll-top" data-sync-scroll="entryReview"><div class="review-scroll-inner"></div></div>
         <div class="table-wrap review-table-wrap" data-sync-scroll="entryReview">
@@ -5127,17 +5047,32 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
         .filter((row) => row.style.display !== "none")
         .map((row) => row.querySelector(".entry-row-check"))
         .filter(Boolean);
-      const rowSearchText = (row) => {{
-        const parts = [row.dataset.search || "", row.innerText || row.textContent || ""];
-        row.querySelectorAll("input").forEach((input) => parts.push(input.value || ""));
-        return parts.join(" ").toLowerCase();
+      const normalizeEntrySearchText = (value) => String(value || "").toLocaleLowerCase().replace(/\s+/g, " ").trim();
+      const refreshEntrySearchIndex = (row) => {{
+        const parts = [row.dataset.search || "", row.textContent || ""];
+        row.querySelectorAll("input, textarea, select").forEach((field) => {{
+          parts.push(field.value || "");
+          if (field.tagName === "SELECT" && field.selectedOptions.length) {{
+            parts.push(field.selectedOptions[0].text || "");
+          }}
+        }});
+        row.dataset.searchIndex = normalizeEntrySearchText(parts.join(" "));
       }};
+      const entryQueryMatches = (row, query) => {{
+        if (!query) return true;
+        const index = row.dataset.searchIndex || "";
+        return query.split(" ").filter(Boolean).every((term) => index.includes(term));
+      }};
+      entryRows().forEach((row) => {{
+        row.dataset.searchIndex = normalizeEntrySearchText(row.dataset.search || "");
+      }});
       const syncEntrySearch = () => {{
-        const query = (entrySearch && entrySearch.value ? entrySearch.value : "").trim().toLowerCase();
+        const query = normalizeEntrySearchText(entrySearch && entrySearch.value ? entrySearch.value : "");
         let visible = 0;
         entryRows().forEach((row) => {{
-          const match = !query || rowSearchText(row).includes(query);
-          row.style.display = match ? "" : "none";
+          const match = entryQueryMatches(row, query);
+          const display = match ? "" : "none";
+          if (row.style.display !== display) row.style.display = display;
           if (match) visible += 1;
         }});
         if (entrySearchCount) {{
@@ -5160,8 +5095,20 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
           entrySelectAllRows.indeterminate = visibleSelected > 0 && visibleSelected < visibleChecks.length;
         }}
       }};
+      let entrySearchTimer = null;
       if (entrySearch) {{
-        entrySearch.addEventListener("input", syncEntrySearch);
+        entrySearch.addEventListener("input", () => {{
+          window.clearTimeout(entrySearchTimer);
+          entrySearchTimer = window.setTimeout(syncEntrySearch, 90);
+        }});
+      }}
+      const entryEditForm = document.querySelector('form[action="/update_entries"]');
+      if (entryEditForm) {{
+        entryEditForm.addEventListener("input", (event) => {{
+          if (event.target === entrySearch) return;
+          const row = event.target.closest(".entry-row");
+          if (row) refreshEntrySearchIndex(row);
+        }});
       }}
       if (entrySelectAllRows) {{
         entrySelectAllRows.addEventListener("change", () => {{
@@ -5183,6 +5130,59 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
               input.dispatchEvent(new Event("input", {{ bubbles: true }}));
             }}
           }});
+          syncEntrySearch();
+          syncEntrySelection();
+        }});
+      }}
+      const replaceLiteral = (value, findText, replacement) => {{
+        const source = String(value || "");
+        const needle = String(findText || "").toLowerCase();
+        if (!needle) return [source, 0];
+        const lowerSource = source.toLowerCase();
+        const parts = [];
+        let position = 0;
+        let count = 0;
+        let foundAt = lowerSource.indexOf(needle, position);
+        while (foundAt !== -1) {{
+          parts.push(source.slice(position, foundAt), replacement);
+          position = foundAt + needle.length;
+          count += 1;
+          foundAt = lowerSource.indexOf(needle, position);
+        }}
+        parts.push(source.slice(position));
+        return [parts.join(""), count];
+      }};
+      const entryApplyReplace = document.getElementById("entryApplyReplace");
+      if (entryApplyReplace) {{
+        entryApplyReplace.addEventListener("click", () => {{
+          const column = document.getElementById("entryBulkColumn").value;
+          const findText = document.getElementById("entryReplaceFind").value;
+          const replacement = document.getElementById("entryReplaceValue").value;
+          const status = document.getElementById("entryReplaceStatus");
+          const selected = entryChecks().filter((check) => check.checked);
+          if (!findText) {{
+            if (status) status.textContent = "Enter the word or text to find";
+            return;
+          }}
+          if (!selected.length) {{
+            if (status) status.textContent = "Select at least one row";
+            return;
+          }}
+          let replacements = 0;
+          let affectedRows = 0;
+          selected.forEach((check) => {{
+            const row = check.closest("tr");
+            const input = row ? row.querySelector(`[name$=":${{column}}"]`) : null;
+            if (!input) return;
+            const [updated, count] = replaceLiteral(input.value, findText, replacement);
+            if (count) {{
+              input.value = updated;
+              input.dispatchEvent(new Event("input", {{ bubbles: true }}));
+              replacements += count;
+              affectedRows += 1;
+            }}
+          }});
+          if (status) status.textContent = `${{replacements}} replacement${{replacements === 1 ? "" : "s"}} in ${{affectedRows}} selected row${{affectedRows === 1 ? "" : "s"}}`;
           syncEntrySearch();
           syncEntrySelection();
         }});
@@ -5258,10 +5258,6 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
       <div class="table-actions">
         <button type="submit">Update XML with edited bill entries</button>
       </div>""" if BILL_FILES else ""
-    replace_panel = render_replace_panel(
-        "/replace_bills",
-        "all current bill fields, items, charges, and the regenerated XML",
-    ) if BILL_FILES else ""
     links = ""
     if run_dir:
         links = """
@@ -5408,7 +5404,6 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
         </table>
       </div>
     </section>
-    {replace_panel}
     <section>
       <form action="/update_bills" method="post">
         {update_button}
@@ -5446,6 +5441,16 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
           <button type="button" id="applyBulk">Apply to selected</button>
           <div id="selectedCount" class="bulk-count">0 rows selected</div>
         </div>
+        <div class="bulk-actions">
+          <label>Find in selected column
+            <input id="billReplaceFind" placeholder="Word or text to change">
+          </label>
+          <label>Replace with
+            <input id="billReplaceValue" placeholder="New word or text">
+          </label>
+          <button type="button" id="billApplyReplace">Replace in selected rows</button>
+          <div id="billReplaceStatus" class="bulk-count">Choose a column above and check the required rows</div>
+        </div>
         <div class="review-scroll-top" data-sync-scroll="billReview"><div class="review-scroll-inner"></div></div>
         <div class="table-wrap review-table-wrap" data-sync-scroll="billReview">
           <table class="review-table">
@@ -5469,16 +5474,23 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
       .map((row) => row.querySelector(".row-check"))
       .filter(Boolean);
     const selectedCount = document.getElementById("selectedCount");
-    const billRowSearchText = (row) => {{
-      const parts = [row.dataset.search || "", row.innerText || row.textContent || ""];
+    const normalizeBillSearchText = (value) => String(value || "").toLocaleLowerCase().replace(/\s+/g, " ").trim();
+    const refreshBillSearchIndex = (row) => {{
+      const parts = [row.dataset.search || "", row.textContent || ""];
       row.querySelectorAll("input, textarea, select").forEach((field) => {{
         parts.push(field.value || "");
         if (field.tagName === "SELECT" && field.selectedOptions.length) {{
           parts.push(field.selectedOptions[0].text || "");
         }}
       }});
-      return parts.join(" ").toLowerCase();
+      row.dataset.searchIndex = normalizeBillSearchText(parts.join(" "));
     }};
+    const billQueryMatches = (row, query) => {{
+      if (!query) return true;
+      const index = row.dataset.searchIndex || "";
+      return query.split(" ").filter(Boolean).every((term) => index.includes(term));
+    }};
+    entryRows().forEach(refreshBillSearchIndex);
     document.querySelectorAll(".review-scroll-top").forEach((topScroll) => {{
       const key = topScroll.dataset.syncScroll;
       const tableWrap = document.querySelector(`.review-table-wrap[data-sync-scroll="${{key}}"]`);
@@ -5492,12 +5504,13 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
       tableWrap.addEventListener("scroll", () => {{ topScroll.scrollLeft = tableWrap.scrollLeft; }});
     }});
     const syncSearchState = () => {{
-      const query = (billSearch && billSearch.value ? billSearch.value : "").trim().toLowerCase();
+      const query = normalizeBillSearchText(billSearch && billSearch.value ? billSearch.value : "");
       const rows = entryRows();
       let visible = 0;
       rows.forEach((row) => {{
-        const match = !query || billRowSearchText(row).includes(query);
-        row.style.display = match ? "" : "none";
+        const match = billQueryMatches(row, query);
+        const display = match ? "" : "none";
+        if (row.style.display !== display) row.style.display = display;
         if (match) visible += 1;
       }});
       if (searchCount) {{
@@ -5526,8 +5539,20 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
         syncSelectionState();
       }});
     }}
+    let billSearchTimer = null;
     if (billSearch) {{
-      billSearch.addEventListener("input", syncSearchState);
+      billSearch.addEventListener("input", () => {{
+        window.clearTimeout(billSearchTimer);
+        billSearchTimer = window.setTimeout(syncSearchState, 90);
+      }});
+    }}
+    const billEditForm = document.querySelector('form[action="/update_bills"]');
+    if (billEditForm) {{
+      billEditForm.addEventListener("input", (event) => {{
+        if (event.target === billSearch) return;
+        const row = event.target.closest(".bill-entry-row");
+        if (row) refreshBillSearchIndex(row);
+      }});
     }}
     rowChecks().forEach((check) => check.addEventListener("change", syncSelectionState));
     const applyBulk = document.getElementById("applyBulk");
@@ -5544,6 +5569,59 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
             input.dispatchEvent(new Event("input", {{ bubbles: true }}));
           }}
         }});
+        syncSearchState();
+        syncSelectionState();
+      }});
+    }}
+    const replaceLiteral = (value, findText, replacement) => {{
+      const source = String(value || "");
+      const needle = String(findText || "").toLowerCase();
+      if (!needle) return [source, 0];
+      const lowerSource = source.toLowerCase();
+      const parts = [];
+      let position = 0;
+      let count = 0;
+      let foundAt = lowerSource.indexOf(needle, position);
+      while (foundAt !== -1) {{
+        parts.push(source.slice(position, foundAt), replacement);
+        position = foundAt + needle.length;
+        count += 1;
+        foundAt = lowerSource.indexOf(needle, position);
+      }}
+      parts.push(source.slice(position));
+      return [parts.join(""), count];
+    }};
+    const billApplyReplace = document.getElementById("billApplyReplace");
+    if (billApplyReplace) {{
+      billApplyReplace.addEventListener("click", () => {{
+        const column = document.getElementById("bulkColumn").value;
+        const findText = document.getElementById("billReplaceFind").value;
+        const replacement = document.getElementById("billReplaceValue").value;
+        const status = document.getElementById("billReplaceStatus");
+        const selected = rowChecks().filter((check) => check.checked);
+        if (!findText) {{
+          if (status) status.textContent = "Enter the word or text to find";
+          return;
+        }}
+        if (!selected.length) {{
+          if (status) status.textContent = "Select at least one row";
+          return;
+        }}
+        let replacements = 0;
+        let affectedRows = 0;
+        selected.forEach((check) => {{
+          const row = check.closest("tr");
+          const input = row ? row.querySelector(`[name$=":${{column}}"]`) : null;
+          if (!input) return;
+          const [updated, count] = replaceLiteral(input.value, findText, replacement);
+          if (count) {{
+            input.value = updated;
+            input.dispatchEvent(new Event("input", {{ bubbles: true }}));
+            replacements += count;
+            affectedRows += 1;
+          }}
+        }});
+        if (status) status.textContent = `${{replacements}} replacement${{replacements === 1 ? "" : "s"}} in ${{affectedRows}} selected row${{affectedRows === 1 ? "" : "s"}}`;
         syncSearchState();
         syncSelectionState();
       }});
@@ -5852,34 +5930,6 @@ def load_xml_editor_file(filename: str, data: bytes) -> int:
     return len(vouchers)
 
 
-def replace_xml_editor_text(find_text: str, replacement: str) -> int:
-    if not find_text:
-        raise ValueError("Enter a word or text to find.")
-    current_tree = XML_EDITOR_STATE.get("tree")
-    if not isinstance(current_tree, ET.ElementTree):
-        raise ValueError("Upload a Tally voucher XML first.")
-    tree = copy.deepcopy(current_tree)
-    messages = [node for node in tree.getroot().iter() if xml_local_name(node.tag) == "TALLYMESSAGE"]
-    if not messages:
-        raise ValueError("No TALLYMESSAGE data records were found in this XML.")
-    replacements = 0
-    for message in messages:
-        for node in message.iter():
-            if node.text:
-                node.text, count = replace_literal_text(node.text, find_text, replacement)
-                replacements += count
-            for attribute, value in list(node.attrib.items()):
-                updated, count = replace_literal_text(value, find_text, replacement)
-                if count:
-                    node.attrib[attribute] = updated
-                    replacements += count
-    if replacements:
-        XML_EDITOR_STATE["tree"] = tree
-        XML_EDITOR_STATE["revision"] = int(XML_EDITOR_STATE.get("revision", 0)) + 1
-        write_xml_editor_output()
-    return replacements
-
-
 def update_xml_editor_from_form(form: dict[str, list[str]]) -> int:
     current_tree = XML_EDITOR_STATE.get("tree")
     if not isinstance(current_tree, ET.ElementTree):
@@ -6026,7 +6076,6 @@ def render_xml_editor_page(message: str = "", is_error: bool = False) -> bytes:
     if rows:
         editor_html = f"""
         <section class="panel status-line">{status}<a class="download" href="/xml-updater/download">Download updated XML</a></section>
-        {render_replace_panel('/xml_replace', 'all master and voucher values in the currently opened XML')}
         <form action="/xml_update" method="post" id="xmlEditForm">
           <section class="panel controls">
             <label>Search vouchers<input id="xmlSearch" placeholder="Voucher no., party, ledger, narration, amount"></label>
@@ -6047,6 +6096,12 @@ def render_xml_editor_page(message: str = "", is_error: bool = False) -> bytes:
             <label>New value<input id="xmlBulkValue" placeholder="Value for selected vouchers"></label>
             <button type="button" id="xmlBulkApply">Apply to selected</button>
             <span id="xmlSelectedCount">0 selected</span>
+          </section>
+          <section class="panel controls">
+            <label>Find in selected column<input id="xmlReplaceFind" placeholder="Word or text to change"></label>
+            <label>Replace with<input id="xmlReplaceValue" placeholder="New word or text"></label>
+            <button type="button" id="xmlApplyReplace">Replace in selected rows</button>
+            <span id="xmlReplaceStatus">Choose a column above and check the required rows</span>
           </section>
           <div class="top-scroll" id="xmlTopScroll"><div></div></div>
           <div class="table-wrap" id="xmlTableWrap">
@@ -6092,18 +6147,53 @@ function refreshCounts() {{
   if (selectedCount) selectedCount.textContent = `${{selected.length}} selected`;
   if (selectAll) {{ selectAll.checked = visible.length > 0 && selected.length === visible.length; selectAll.indeterminate = selected.length > 0 && selected.length < visible.length; }}
 }}
+function normalizeXmlSearchText(value) {{ return String(value || '').toLocaleLowerCase().replace(/\s+/g, ' ').trim(); }}
+function refreshXmlSearchIndex(row) {{
+  const current = Array.from(row.querySelectorAll('input,textarea,select')).map(el => {{
+    if (el.tagName === 'SELECT' && el.selectedOptions.length) return `${{el.value || ''}} ${{el.selectedOptions[0].text || ''}}`;
+    return el.value || '';
+  }}).join(' ');
+  row.dataset.searchIndex = normalizeXmlSearchText(`${{row.dataset.search || ''}} ${{row.textContent || ''}} ${{current}}`);
+}}
+function xmlQueryMatches(row, query) {{ return !query || query.split(' ').filter(Boolean).every(term => (row.dataset.searchIndex || '').includes(term)); }}
+rows().forEach(row => {{ row.dataset.searchIndex = normalizeXmlSearchText(row.dataset.search || ''); }});
 function filterRows() {{
-  const query = (search?.value || '').trim().toLowerCase();
-  rows().forEach(row => {{ const current = Array.from(row.querySelectorAll('input,textarea')).map(el => el.value).join(' ').toLowerCase(); row.style.display = (!query || (row.dataset.search + ' ' + current).includes(query)) ? '' : 'none'; }});
+  const query = normalizeXmlSearchText(search?.value || '');
+  rows().forEach(row => {{ const display = xmlQueryMatches(row, query) ? '' : 'none'; if (row.style.display !== display) row.style.display = display; }});
   refreshCounts();
 }}
-if (search) search.addEventListener('input', filterRows);
+let xmlSearchTimer = null;
+if (search) search.addEventListener('input', () => {{ window.clearTimeout(xmlSearchTimer); xmlSearchTimer = window.setTimeout(filterRows, 90); }});
+const xmlEditForm = document.getElementById('xmlEditForm');
+if (xmlEditForm) xmlEditForm.addEventListener('input', event => {{ if (event.target === search) return; const row = event.target.closest('.xml-row'); if (row) refreshXmlSearchIndex(row); }});
 if (selectAll) selectAll.addEventListener('change', () => {{ visibleRows().forEach(row => row.querySelector('.xml-row-check').checked = selectAll.checked); refreshCounts(); }});
 checks().forEach(check => check.addEventListener('change', refreshCounts));
 const bulkApply = document.getElementById('xmlBulkApply');
 if (bulkApply) bulkApply.addEventListener('click', () => {{
   const column = document.getElementById('xmlBulkColumn').value; const value = document.getElementById('xmlBulkValue').value;
   visibleRows().filter(row => row.querySelector('.xml-row-check').checked).forEach(row => {{ const field = row.querySelector(`[name$=":${{column}}"]`); if (field) {{ field.value = value; field.dispatchEvent(new Event('input', {{bubbles:true}})); }} }}); filterRows();
+}});
+function replaceLiteral(value, findText, replacement) {{
+  const source = String(value || ''); const needle = String(findText || '').toLowerCase();
+  if (!needle) return [source, 0];
+  const lowerSource = source.toLowerCase(); const parts = []; let position = 0; let count = 0; let foundAt = lowerSource.indexOf(needle, position);
+  while (foundAt !== -1) {{ parts.push(source.slice(position, foundAt), replacement); position = foundAt + needle.length; count += 1; foundAt = lowerSource.indexOf(needle, position); }}
+  parts.push(source.slice(position)); return [parts.join(''), count];
+}}
+const xmlApplyReplace = document.getElementById('xmlApplyReplace');
+if (xmlApplyReplace) xmlApplyReplace.addEventListener('click', () => {{
+  const column = document.getElementById('xmlBulkColumn').value; const findText = document.getElementById('xmlReplaceFind').value; const replacement = document.getElementById('xmlReplaceValue').value; const status = document.getElementById('xmlReplaceStatus');
+  const selected = rows().filter(row => row.querySelector('.xml-row-check').checked);
+  if (!findText) {{ if (status) status.textContent = 'Enter the word or text to find'; return; }}
+  if (!selected.length) {{ if (status) status.textContent = 'Select at least one row'; return; }}
+  let replacements = 0; let affectedRows = 0;
+  selected.forEach(row => {{
+    const field = row.querySelector(`[name$=":${{column}}"]`); if (!field) return;
+    const [updated, count] = replaceLiteral(field.value, findText, replacement);
+    if (count) {{ field.value = updated; field.dispatchEvent(new Event('input', {{bubbles:true}})); replacements += count; affectedRows += 1; }}
+  }});
+  if (status) status.textContent = `${{replacements}} replacement${{replacements === 1 ? '' : 's'}} in ${{affectedRows}} selected row${{affectedRows === 1 ? '' : 's'}}`;
+  filterRows();
 }});
 const topScroll = document.getElementById('xmlTopScroll'); const tableWrap = document.getElementById('xmlTableWrap'); let syncing = false;
 if (topScroll && tableWrap) {{ topScroll.firstElementChild.style.width = `${{tableWrap.scrollWidth}}px`; topScroll.addEventListener('scroll', () => {{ if (!syncing) {{ syncing=true; tableWrap.scrollLeft=topScroll.scrollLeft; syncing=false; }} }}); tableWrap.addEventListener('scroll', () => {{ if (!syncing) {{ syncing=true; topScroll.scrollLeft=tableWrap.scrollLeft; syncing=false; }} }}); }}
@@ -6234,24 +6324,6 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(page)
             return
-        if self.path == "/xml_replace":
-            length = int(self.headers.get("Content-Length", "0"))
-            form = parse_qs(self.rfile.read(length).decode("utf-8", errors="ignore"), keep_blank_values=True)
-            try:
-                find_text = form.get("find_text", [""])[0]
-                replacement = form.get("replace_text", [""])[0]
-                count = replace_xml_editor_text(find_text, replacement)
-                revision = int(XML_EDITOR_STATE.get("revision", 0))
-                page = render_xml_editor_page(
-                    f"Replaced {count} occurrence{'s' if count != 1 else ''} across the XML. Revision {revision} is ready to download."
-                )
-            except Exception as exc:
-                page = render_xml_editor_page(str(exc), is_error=True)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(page)
-            return
         if self.path == "/setup":
             length = int(self.headers.get("Content-Length", "0"))
             form = parse_qs(self.rfile.read(length).decode("utf-8", errors="ignore"))
@@ -6300,26 +6372,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(render_bill_page("Cleared bill batch. Upload fresh bills now."))
-            return
-        if self.path == "/replace_bills":
-            length = int(self.headers.get("Content-Length", "0"))
-            form = parse_qs(self.rfile.read(length).decode("utf-8", errors="ignore"), keep_blank_values=True)
-            find_text = form.get("find_text", [""])[0]
-            replacement = form.get("replace_text", [""])[0]
-            try:
-                replacements, affected = replace_entries_text(active_bill_entries(), find_text, replacement)
-                run_dir = rebuild_bill_outputs()
-                message = (
-                    f"Replaced {replacements} occurrence{'s' if replacements != 1 else ''} "
-                    f"in {affected} bill entr{'y' if affected == 1 else 'ies'} and regenerated the XML."
-                )
-            except Exception as exc:
-                run_dir = BILL_LAST_RUN_DIR
-                message = str(exc)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(render_bill_page(message, run_dir))
             return
         if self.path == "/update_bills":
             length = int(self.headers.get("Content-Length", "0"))
@@ -6389,26 +6441,6 @@ class Handler(BaseHTTPRequestHandler):
                     updated += 1
             run_dir = rebuild_active_outputs()
             message = f"Updated {updated} entr{'y' if updated == 1 else 'ies'} and regenerated the XML."
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(render_page(message, run_dir))
-            return
-        if self.path == "/replace_entries":
-            length = int(self.headers.get("Content-Length", "0"))
-            form = parse_qs(self.rfile.read(length).decode("utf-8", errors="ignore"), keep_blank_values=True)
-            find_text = form.get("find_text", [""])[0]
-            replacement = form.get("replace_text", [""])[0]
-            try:
-                replacements, affected = replace_entries_text(active_entries(), find_text, replacement)
-                run_dir = rebuild_active_outputs()
-                message = (
-                    f"Replaced {replacements} occurrence{'s' if replacements != 1 else ''} "
-                    f"in {affected} entr{'y' if affected == 1 else 'ies'} and regenerated the XML."
-                )
-            except Exception as exc:
-                run_dir = LAST_RUN_DIR
-                message = str(exc)
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
