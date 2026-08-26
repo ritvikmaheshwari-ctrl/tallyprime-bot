@@ -282,7 +282,17 @@ def normalize_date(value: object) -> str:
         return ""
     eight_digit = re.fullmatch(r"(\d{4})(\d{2})(\d{2})", text)
     if eight_digit:
-        return f"{eight_digit.group(1)}{eight_digit.group(2)}{eight_digit.group(3)}"
+        try:
+            return datetime(
+                int(eight_digit.group(1)),
+                int(eight_digit.group(2)),
+                int(eight_digit.group(3)),
+            ).strftime("%Y%m%d")
+        except ValueError:
+            return ""
+    explicit_numeric = parse_numeric_date_by_mode(text, current_date_parse_mode())
+    if explicit_numeric:
+        return explicit_numeric
     iso_date = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", text)
     if iso_date:
         try:
@@ -293,9 +303,6 @@ def normalize_date(value: object) -> str:
             ).strftime("%Y%m%d")
         except ValueError:
             return ""
-    explicit_numeric = parse_numeric_date_by_mode(text, current_date_parse_mode())
-    if explicit_numeric:
-        return explicit_numeric
     mode = current_date_parse_mode()
     if mode == "ymd":
         parsed = pd.to_datetime(text, yearfirst=True, dayfirst=False, errors="coerce")
@@ -4446,7 +4453,18 @@ def format_item_column(entry: Entry, key: str) -> str:
 def display_date(date_text: str) -> str:
     normalized = normalize_date(date_text)
     if re.fullmatch(r"\d{8}", normalized):
-        return f"{normalized[0:4]}-{normalized[4:6]}-{normalized[6:8]}"
+        year, month, day = normalized[0:4], normalized[4:6], normalized[6:8]
+        mode = current_date_parse_mode()
+        formats = {
+            "dmy": f"{day}-{month}-{year}",
+            "mdy": f"{month}-{day}-{year}",
+            "ymd": f"{year}-{month}-{day}",
+            "dym": f"{day}-{year}-{month}",
+            "myd": f"{month}-{year}-{day}",
+            "ydm": f"{year}-{day}-{month}",
+        }
+        # Auto detection defaults to the Indian DD-MM-YYYY review format.
+        return formats.get(mode, formats["dmy"])
     return date_text
 
 
@@ -4765,6 +4783,7 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
                     e.voucher_number,
                     e.voucher_type,
                     e.date,
+                    display_date(e.date),
                     e.party_ledger,
                     e.debit_ledger,
                     e.credit_ledger,
@@ -4779,7 +4798,7 @@ def render_page(message: str = "", run_dir: Path | None = None, entries: list[En
                   <td>{html.escape(e.source_file)}</td>
                   <td><input class="small-input" name="{prefix}:voucher_number" value="{html.escape(e.voucher_number)}"></td>
                   <td><input class="small-input" name="{prefix}:voucher_type" value="{html.escape(e.voucher_type)}"></td>
-                  <td><input class="small-input" type="date" name="{prefix}:date" value="{html.escape(display_date(e.date))}"></td>
+                  <td><input class="small-input date-text-input" type="text" inputmode="numeric" placeholder="{date_placeholder}" name="{prefix}:date" value="{html.escape(display_date(e.date))}"></td>
                   <td><input class="ledger-input" name="{prefix}:party_ledger" value="{html.escape(e.party_ledger)}"></td>
                   <td><input class="ledger-input" name="{prefix}:debit_ledger" value="{html.escape(e.debit_ledger)}"></td>
                   <td><input class="ledger-input" name="{prefix}:credit_ledger" value="{html.escape(e.credit_ledger)}"></td>
@@ -5225,7 +5244,7 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
 {charge_inputs}
               <td><input class="small-input" name="{prefix}:voucher_number" value="{html.escape(bill_number_from_entry(e))}"></td>
               <td><input class="small-input" name="{prefix}:voucher_type" value="{html.escape(e.voucher_type)}"></td>
-              <td><input class="small-input" type="date" name="{prefix}:date" value="{html.escape(display_date(e.date))}"></td>
+              <td><input class="small-input date-text-input" type="text" inputmode="numeric" placeholder="{date_format_placeholder(current_date_parse_mode())}" name="{prefix}:date" value="{html.escape(display_date(e.date))}"></td>
               <td><input class="ledger-input" name="{prefix}:party_ledger" value="{html.escape(e.party_ledger)}"></td>
               <td><input class="ledger-input" name="{prefix}:debit_ledger" value="{html.escape(e.debit_ledger)}"></td>
               <td><input class="ledger-input" name="{prefix}:credit_ledger" value="{html.escape(e.credit_ledger)}"></td>
@@ -6060,7 +6079,7 @@ def render_xml_editor_page(message: str = "", is_error: bool = False) -> bytes:
           <td>{html.escape(filename)}</td>
           <td><input name="{prefix}:voucher_number" value="{html.escape(str(row['voucher_number']))}"></td>
           <td><input name="{prefix}:voucher_type" value="{html.escape(str(row['voucher_type']))}"></td>
-          <td><input type="date" name="{prefix}:date" value="{html.escape(display_date(str(row['date'])))}"></td>
+          <td><input class="date-text-input" type="text" inputmode="numeric" placeholder="{date_format_placeholder(current_date_parse_mode())}" name="{prefix}:date" value="{html.escape(display_date(str(row['date'])))}"></td>
           <td><input class="party-input" name="{prefix}:party_ledger" value="{html.escape(str(row['party_ledger']))}"></td>
           <td><input class="ledger-input" name="{prefix}:debit_ledger" value="{html.escape(str(row['debit_ledger']))}"></td>
           <td><input class="ledger-input" name="{prefix}:credit_ledger" value="{html.escape(str(row['credit_ledger']))}"></td>
