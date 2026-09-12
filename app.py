@@ -1922,26 +1922,55 @@ def extract_text_file(path: Path) -> str:
 
 
 def bill_entry_ledgers(entry_type: str, party: str) -> tuple[str, str, str]:
-    kind = entry_type.strip().lower()
+    raw_kind, separator, raw_note_type = entry_type.strip().lower().partition("|")
+    kind = re.sub(r"[\s_-]+", " ", raw_kind)
+    note_type = re.sub(r"[\s_-]+", " ", raw_note_type) if separator else ""
     party_ledger = party.strip() or DEFAULT_SUSPENSE_LEDGER
-    if kind == "sale":
-        return "Sales", party_ledger, "Sales Accounts"
-    if kind == "expense":
-        return "Payment", "Expense", party_ledger
-    if kind == "asset":
-        return "Purchase", "Fixed Assets", party_ledger
-    return "Purchase", "Purchase Accounts", party_ledger
+    if not separator and kind in {"credit note", "sale return", "sales return"}:
+        kind, note_type = "sale", "credit note"
+    elif not separator and kind in {"debit note", "purchase return"}:
+        kind, note_type = "purchase", "debit note"
+
+    if kind in {"sale", "sales", "sale bill", "sales bill"}:
+        main_ledger = "Sales Accounts"
+        regular_voucher_type = "Sales"
+    elif kind == "expense":
+        main_ledger = "Expense"
+        regular_voucher_type = "Payment"
+    elif kind in {"asset", "asset purchase"}:
+        main_ledger = "Fixed Assets"
+        regular_voucher_type = "Purchase"
+    else:
+        main_ledger = "Purchase Accounts"
+        regular_voucher_type = "Purchase"
+
+    if note_type == "debit note":
+        return "Debit Note", main_ledger, party_ledger
+    if note_type == "credit note":
+        return "Credit Note", party_ledger, main_ledger
+    if regular_voucher_type == "Sales":
+        return regular_voucher_type, party_ledger, main_ledger
+    return regular_voucher_type, main_ledger, party_ledger
 
 
 def bill_main_ledger_parent(voucher_type: str, ledger_name: str) -> str:
     clean = ledger_name.strip().lower()
     if clean in {"fixed assets", "asset", "assets"}:
         return "Fixed Assets"
+    if "sales" in clean:
+        return "Sales Accounts"
+    if "purchase" in clean:
+        return "Purchase Accounts"
     if clean in {"expense", "expenses"} or "expense" in clean:
         return "Purchase Accounts" if voucher_type == "Purchase" else "Indirect Expenses"
     if voucher_type in {"Sales", "Credit Note"}:
         return "Sales Accounts"
     return "Purchase Accounts"
+
+
+def bill_uses_output_tax(voucher_type: str, debit_ledger: str, credit_ledger: str) -> bool:
+    main_ledger = credit_ledger if voucher_type in {"Sales", "Credit Note"} else debit_ledger
+    return bill_main_ledger_parent(voucher_type, main_ledger) == "Sales Accounts"
 
 
 def split_bill_texts(text: str) -> list[str]:
@@ -2779,9 +2808,8 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
                     debit_ledger = "Purchase Accounts"
                     credit_ledger = party
                 else:
-                    row_entry_type = "sale" if entry_type.strip().lower() == "sale" else "purchase"
                     party = party_from_particulars(particulars)
-                    voucher_type, debit_ledger, credit_ledger = bill_entry_ledgers(row_entry_type, party)
+                    voucher_type, debit_ledger, credit_ledger = bill_entry_ledgers(entry_type, party)
                     amount = debit or credit
 
                 entries.append(Entry(
@@ -3025,7 +3053,13 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
             "name",
         ]) or DEFAULT_SUSPENSE_LEDGER
         row_entry_type = str(pick(["entry type", "voucher type", "note type", "type"])).strip().lower() or entry_type
-        is_sale_row = "sale" in row_entry_type
+        row_type_key = re.sub(r"[\s_-]+", " ", row_entry_type)
+        default_voucher_type = bill_entry_ledgers(entry_type, party)[0]
+        if default_voucher_type == "Purchase" and "credit note" in row_type_key:
+            voucher_type, debit_ledger, credit_ledger = "Debit Note", "Purchase Accounts", party
+        else:
+            voucher_type, debit_ledger, credit_ledger = bill_entry_ledgers(row_entry_type, party)
+        is_sale_row = bill_uses_output_tax(voucher_type, debit_ledger, credit_ledger)
         amount = pick_money(
             ["taxable value", "taxable amount", "basic amount", "sub total"],
             ["total", "cgst", "sgst", "igst", "cess", "rate", "%"],
@@ -3083,15 +3117,25 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
         rate_notes = row_rate_notes()
         if rate_notes:
             narration = f"{narration} | " + " | ".join(rate_notes)
-        if entry_type.strip().lower() == "purchase" and "credit note" in row_entry_type:
-            voucher_type, debit_ledger, credit_ledger = "Debit Note", party, "Purchase Accounts"
-        else:
-            voucher_type, debit_ledger, credit_ledger = bill_entry_ledgers(row_entry_type, party)
         voucher_override = str(pick(["voucher type", "voucher"])).strip()
         debit_override = str(pick(["debit ledger", "debit account", "dr ledger", "dr account"])).strip()
         credit_override = str(pick(["credit ledger", "credit account", "cr ledger", "cr account"])).strip()
         if voucher_override:
-            voucher_type = voucher_override
+            voucher_key = re.sub(r"[\s_-]+", " ", voucher_override.lower())
+            recognized_types = {
+                "purchase", "purchase bill", "sale", "sales", "sale bill", "sales bill",
+                "debit note", "purchase return", "credit note", "sale return", "sales return",
+                "expense", "asset",
+            }
+            purchase_credit_note = (
+                voucher_type == "Debit Note"
+                and default_voucher_type == "Purchase"
+                and "credit note" in voucher_key
+            )
+            if voucher_key in recognized_types and not purchase_credit_note:
+                voucher_type, debit_ledger, credit_ledger = bill_entry_ledgers(voucher_override, party)
+            elif not purchase_credit_note:
+                voucher_type = voucher_override
         if debit_override:
             debit_ledger = debit_override
         if usable_ledger_name(credit_override):
@@ -3437,7 +3481,8 @@ def item_quantity(item: dict) -> float:
 def bill_tally_party(entry: Entry) -> str:
     party = (entry.party_ledger or DEFAULT_SUSPENSE_LEDGER).strip() or DEFAULT_SUSPENSE_LEDGER
     if party.lower() == DEFAULT_SUSPENSE_LEDGER.lower():
-        return "Suspense Customer" if entry.voucher_type == "Sales" else "Suspense Supplier"
+        is_customer = bill_uses_output_tax(entry.voucher_type, entry.debit_ledger, entry.credit_ledger)
+        return "Suspense Customer" if is_customer else "Suspense Supplier"
     return party
 
 
@@ -3447,15 +3492,15 @@ def inventory_line_xml(entry: Entry, item: dict) -> str:
     unit = xml_text(item_unit(item))
     qty = item_quantity(item)
     rate = float(item.get("rate", 0) or 0)
-    is_sale = entry.voucher_type == "Sales"
-    is_deemed_positive = "No" if is_sale else "Yes"
-    amount_value = amount if is_sale else -amount
-    qty_value = -qty if is_sale else qty
+    is_outward = entry.voucher_type in {"Sales", "Debit Note"}
+    is_deemed_positive = "No" if is_outward else "Yes"
+    amount_value = amount if is_outward else -amount
+    qty_value = -qty if is_outward else qty
     qty_xml = f"""
       <ACTUALQTY>{qty_value:.4f} {unit}</ACTUALQTY>
       <BILLEDQTY>{qty_value:.4f} {unit}</BILLEDQTY>""" if qty else ""
     rate_xml = f"\n      <RATE>{rate:.2f}/{unit}</RATE>" if rate else ""
-    allocation_ledger = entry.credit_ledger if is_sale else entry.debit_ledger
+    allocation_ledger = entry.credit_ledger if entry.voucher_type in {"Sales", "Credit Note"} else entry.debit_ledger
     return f"""
     <ALLINVENTORYENTRIES.LIST>
       <STOCKITEMNAME>{name}</STOCKITEMNAME>
@@ -3541,25 +3586,26 @@ def inventory_voucher_xml(entry: Entry, run_id: str = "") -> str:
     voucher_type = entry.voucher_type
     narration = entry.narration
     party = bill_tally_party(entry)
-    is_sale = voucher_type == "Sales"
+    is_outward = voucher_type in {"Sales", "Debit Note"}
+    uses_output_tax = bill_uses_output_tax(voucher_type, entry.debit_ledger, entry.credit_ledger)
     inventory_xml = "\n".join(inventory_line_xml(entry, item) for item in entry.inventory_items if float(item.get("amount", 0) or 0) > 0)
-    party_amount = -voucher_amount(entry) if is_sale else voucher_amount(entry)
+    party_amount = -voucher_amount(entry) if is_outward else voucher_amount(entry)
     party_xml = accounting_ledger_entry_xml(party, party_amount, is_party=True)
     ledger_parts: list[str] = []
     for charge in entry.charge_lines:
         ledger = str(charge.get("ledger", "")).strip()
         amount = float(charge.get("amount", 0) or 0)
         if ledger and amount:
-            signed = abs(amount) if is_sale else -abs(amount)
+            signed = abs(amount) if is_outward else -abs(amount)
             if amount < 0:
                 signed = -signed
             ledger_parts.append(ledger_entry_xml(ledger, signed))
     if entry.cgst_amount:
-        ledger_parts.append(ledger_entry_xml("Output CGST" if is_sale else "Input CGST", entry.cgst_amount if is_sale else -entry.cgst_amount))
+        ledger_parts.append(ledger_entry_xml("Output CGST" if uses_output_tax else "Input CGST", entry.cgst_amount if is_outward else -entry.cgst_amount))
     if entry.sgst_amount:
-        ledger_parts.append(ledger_entry_xml("Output SGST" if is_sale else "Input SGST", entry.sgst_amount if is_sale else -entry.sgst_amount))
+        ledger_parts.append(ledger_entry_xml("Output SGST" if uses_output_tax else "Input SGST", entry.sgst_amount if is_outward else -entry.sgst_amount))
     if entry.igst_amount:
-        ledger_parts.append(ledger_entry_xml("Output IGST" if is_sale else "Input IGST", entry.igst_amount if is_sale else -entry.igst_amount))
+        ledger_parts.append(ledger_entry_xml("Output IGST" if uses_output_tax else "Input IGST", entry.igst_amount if is_outward else -entry.igst_amount))
     ledger_xml_body = "\n".join(ledger_parts)
     return f"""
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
@@ -3588,7 +3634,7 @@ def accounting_bill_voucher_xml(entry: Entry, run_id: str = "") -> str:
     is_sale = voucher_type == "Sales"
     is_sales_return = voucher_type == "Credit Note"
     is_purchase_return = voucher_type == "Debit Note"
-    uses_output_tax = is_sale or is_sales_return
+    uses_output_tax = bill_uses_output_tax(voucher_type, entry.debit_ledger, entry.credit_ledger)
     ref_name = bill_reference(entry)
     voucher_number = bill_number_from_entry(entry)
     voucher_number_xml = ""
@@ -3632,7 +3678,7 @@ def accounting_bill_voucher_xml(entry: Entry, run_id: str = "") -> str:
         ledger_amounts.append((entry.credit_ledger or "Sales Accounts", -abs(base_amount), False))
     elif is_purchase_return:
         ledger_amounts.append((party_name, -abs(total_amount), True))
-        ledger_amounts.append((entry.credit_ledger or "Purchase Accounts", abs(base_amount), False))
+        ledger_amounts.append((entry.debit_ledger or "Purchase Accounts", abs(base_amount), False))
     else:
         ledger_amounts.append((party_name, abs(total_amount), True))
         ledger_amounts.append((entry.debit_ledger, -abs(base_amount), False))
@@ -4141,11 +4187,11 @@ def write_outputs(entries: list[Entry], raw_extracts: list[dict]) -> Path:
                 ledger_names[clean] = "Indirect Expenses"
             elif clean.lower() == "fixed assets":
                 ledger_names[clean] = "Fixed Assets"
-            elif entry.source_kind == "Bill" and clean.lower() == (entry.party_ledger or "").strip().lower() and entry.voucher_type in {"Sales", "Credit Note"}:
+            elif entry.source_kind == "Bill" and clean.lower() == (entry.party_ledger or "").strip().lower() and bill_uses_output_tax(entry.voucher_type, entry.debit_ledger, entry.credit_ledger):
                 ledger_names[clean] = "Sundry Debtors"
             elif entry.source_kind == "Bill" and clean.lower() == (entry.party_ledger or "").strip().lower():
                 ledger_names[clean] = "Sundry Creditors"
-            elif entry.source_kind == "Bill" and clean.lower() == (entry.debit_ledger or "").strip().lower() and entry.voucher_type == "Purchase":
+            elif entry.source_kind == "Bill" and clean.lower() == (entry.debit_ledger or "").strip().lower() and entry.voucher_type in {"Purchase", "Debit Note"}:
                 ledger_names[clean] = bill_main_ledger_parent(entry.voucher_type, clean)
             elif entry.source_kind == "Bill" and clean.lower() == (entry.credit_ledger or "").strip().lower() and entry.voucher_type in {"Sales", "Credit Note"}:
                 ledger_names[clean] = bill_main_ledger_parent(entry.voucher_type, clean)
@@ -4158,16 +4204,17 @@ def write_outputs(entries: list[Entry], raw_extracts: list[dict]) -> Path:
         if entry.source_kind == "Bill":
             mapped_party = bill_tally_party(entry)
             if mapped_party:
-                ledger_names[mapped_party] = "Sundry Debtors" if entry.voucher_type in {"Sales", "Credit Note"} else "Sundry Creditors"
+                uses_output_tax = bill_uses_output_tax(entry.voucher_type, entry.debit_ledger, entry.credit_ledger)
+                ledger_names[mapped_party] = "Sundry Debtors" if uses_output_tax else "Sundry Creditors"
                 gstin = (entry.party_gstin or "").strip().upper()
                 if GSTIN_RE.fullmatch(gstin):
                     party_gstins.setdefault(mapped_party, set()).add(gstin)
             if entry.cgst_amount:
-                ledger_names["Output CGST" if entry.voucher_type in {"Sales", "Credit Note"} else "Input CGST"] = "Duties & Taxes"
+                ledger_names["Output CGST" if uses_output_tax else "Input CGST"] = "Duties & Taxes"
             if entry.sgst_amount:
-                ledger_names["Output SGST" if entry.voucher_type in {"Sales", "Credit Note"} else "Input SGST"] = "Duties & Taxes"
+                ledger_names["Output SGST" if uses_output_tax else "Input SGST"] = "Duties & Taxes"
             if entry.igst_amount:
-                ledger_names["Output IGST" if entry.voucher_type in {"Sales", "Credit Note"} else "Input IGST"] = "Duties & Taxes"
+                ledger_names["Output IGST" if uses_output_tax else "Input IGST"] = "Duties & Taxes"
             for charge in entry.charge_lines:
                 ledger = str(charge.get("ledger", "")).strip()
                 if ledger:
@@ -5377,6 +5424,13 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
                   <option value="asset">Asset purchase</option>
                 </select>
               </label>
+              <label>Document type
+                <select name="note_type">
+                  <option value="regular">Regular</option>
+                  <option value="debit_note">Debit Note</option>
+                  <option value="credit_note">Credit Note</option>
+                </select>
+              </label>
               <label>Date format
                 <select name="date_format">{date_options}</select>
               </label>
@@ -5399,6 +5453,13 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
                   <option value="sale">Sale bill</option>
                   <option value="expense">Expense</option>
                   <option value="asset">Asset purchase</option>
+                </select>
+              </label>
+              <label>Document type
+                <select name="note_type">
+                  <option value="regular">Regular</option>
+                  <option value="debit_note">Debit Note</option>
+                  <option value="credit_note">Credit Note</option>
                 </select>
               </label>
               <label>Date format
@@ -6422,6 +6483,9 @@ class Handler(BaseHTTPRequestHandler):
             files, fields = parse_multipart(self.rfile.read(length), self.headers.get("Content-Type", ""))
             set_date_parse_mode(fields.get("date_format", "auto"))
             entry_type = fields.get("entry_type", "purchase").strip() or "purchase"
+            note_type = fields.get("note_type", "regular").strip().lower() or "regular"
+            if note_type in {"debit_note", "credit_note"}:
+                entry_type = f"{entry_type}|{note_type}"
             bill_source = fields.get("bill_source", "generated").strip() or "generated"
             for filename, data in files:
                 save_path = UPLOADS_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename}"
