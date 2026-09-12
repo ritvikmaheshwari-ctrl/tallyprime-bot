@@ -1945,9 +1945,9 @@ def bill_entry_ledgers(entry_type: str, party: str) -> tuple[str, str, str]:
         regular_voucher_type = "Purchase"
 
     if note_type == "debit note":
-        return "Debit Note", main_ledger, party_ledger
+        return "Debit Note", party_ledger, main_ledger
     if note_type == "credit note":
-        return "Credit Note", party_ledger, main_ledger
+        return "Credit Note", main_ledger, party_ledger
     if regular_voucher_type == "Sales":
         return regular_voucher_type, party_ledger, main_ledger
     return regular_voucher_type, main_ledger, party_ledger
@@ -1969,7 +1969,7 @@ def bill_main_ledger_parent(voucher_type: str, ledger_name: str) -> str:
 
 
 def bill_uses_output_tax(voucher_type: str, debit_ledger: str, credit_ledger: str) -> bool:
-    main_ledger = credit_ledger if voucher_type in {"Sales", "Credit Note"} else debit_ledger
+    main_ledger = credit_ledger if voucher_type in {"Sales", "Debit Note"} else debit_ledger
     return bill_main_ledger_parent(voucher_type, main_ledger) == "Sales Accounts"
 
 
@@ -3056,7 +3056,7 @@ def extract_bill_spreadsheet(path: Path, entry_type: str = "purchase", sheet_nam
         row_type_key = re.sub(r"[\s_-]+", " ", row_entry_type)
         default_voucher_type = bill_entry_ledgers(entry_type, party)[0]
         if default_voucher_type == "Purchase" and "credit note" in row_type_key:
-            voucher_type, debit_ledger, credit_ledger = "Debit Note", "Purchase Accounts", party
+            voucher_type, debit_ledger, credit_ledger = "Debit Note", party, "Purchase Accounts"
         else:
             voucher_type, debit_ledger, credit_ledger = bill_entry_ledgers(row_entry_type, party)
         is_sale_row = bill_uses_output_tax(voucher_type, debit_ledger, credit_ledger)
@@ -3500,7 +3500,7 @@ def inventory_line_xml(entry: Entry, item: dict) -> str:
       <ACTUALQTY>{qty_value:.4f} {unit}</ACTUALQTY>
       <BILLEDQTY>{qty_value:.4f} {unit}</BILLEDQTY>""" if qty else ""
     rate_xml = f"\n      <RATE>{rate:.2f}/{unit}</RATE>" if rate else ""
-    allocation_ledger = entry.credit_ledger if entry.voucher_type in {"Sales", "Credit Note"} else entry.debit_ledger
+    allocation_ledger = entry.credit_ledger if entry.voucher_type in {"Sales", "Debit Note"} else entry.debit_ledger
     return f"""
     <ALLINVENTORYENTRIES.LIST>
       <STOCKITEMNAME>{name}</STOCKITEMNAME>
@@ -3675,10 +3675,10 @@ def accounting_bill_voucher_xml(entry: Entry, run_id: str = "") -> str:
         ledger_amounts.append((entry.credit_ledger, abs(base_amount), False))
     elif is_sales_return:
         ledger_amounts.append((party_name, abs(total_amount), True))
-        ledger_amounts.append((entry.credit_ledger or "Sales Accounts", -abs(base_amount), False))
+        ledger_amounts.append((entry.debit_ledger or "Sales Accounts", -abs(base_amount), False))
     elif is_purchase_return:
         ledger_amounts.append((party_name, -abs(total_amount), True))
-        ledger_amounts.append((entry.debit_ledger or "Purchase Accounts", abs(base_amount), False))
+        ledger_amounts.append((entry.credit_ledger or "Purchase Accounts", abs(base_amount), False))
     else:
         ledger_amounts.append((party_name, abs(total_amount), True))
         ledger_amounts.append((entry.debit_ledger, -abs(base_amount), False))
@@ -4191,9 +4191,9 @@ def write_outputs(entries: list[Entry], raw_extracts: list[dict]) -> Path:
                 ledger_names[clean] = "Sundry Debtors"
             elif entry.source_kind == "Bill" and clean.lower() == (entry.party_ledger or "").strip().lower():
                 ledger_names[clean] = "Sundry Creditors"
-            elif entry.source_kind == "Bill" and clean.lower() == (entry.debit_ledger or "").strip().lower() and entry.voucher_type in {"Purchase", "Debit Note"}:
+            elif entry.source_kind == "Bill" and clean.lower() == (entry.debit_ledger or "").strip().lower() and entry.voucher_type in {"Purchase", "Credit Note"}:
                 ledger_names[clean] = bill_main_ledger_parent(entry.voucher_type, clean)
-            elif entry.source_kind == "Bill" and clean.lower() == (entry.credit_ledger or "").strip().lower() and entry.voucher_type in {"Sales", "Credit Note"}:
+            elif entry.source_kind == "Bill" and clean.lower() == (entry.credit_ledger or "").strip().lower() and entry.voucher_type in {"Sales", "Debit Note"}:
                 ledger_names[clean] = bill_main_ledger_parent(entry.voucher_type, clean)
             elif entry.voucher_type == "Receipt":
                 ledger_names[clean] = "Sundry Debtors"
@@ -5419,16 +5419,11 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
               <label>Default entry type
                 <select name="entry_type">
                   <option value="purchase">Purchase bill</option>
+                  <option value="purchase_return">Purchase return (Debit Note)</option>
                   <option value="sale">Sale bill</option>
+                  <option value="sales_return">Sales return (Credit Note)</option>
                   <option value="expense">Expense</option>
                   <option value="asset">Asset purchase</option>
-                </select>
-              </label>
-              <label>Document type
-                <select name="note_type">
-                  <option value="regular">Regular</option>
-                  <option value="debit_note">Debit Note</option>
-                  <option value="credit_note">Credit Note</option>
                 </select>
               </label>
               <label>Date format
@@ -5450,16 +5445,11 @@ def render_bill_page(message: str = "", run_dir: Path | None = None) -> bytes:
               <label>Default entry type
                 <select name="entry_type">
                   <option value="purchase">Purchase bill</option>
+                  <option value="purchase_return">Purchase return (Debit Note)</option>
                   <option value="sale">Sale bill</option>
+                  <option value="sales_return">Sales return (Credit Note)</option>
                   <option value="expense">Expense</option>
                   <option value="asset">Asset purchase</option>
-                </select>
-              </label>
-              <label>Document type
-                <select name="note_type">
-                  <option value="regular">Regular</option>
-                  <option value="debit_note">Debit Note</option>
-                  <option value="credit_note">Credit Note</option>
                 </select>
               </label>
               <label>Date format
